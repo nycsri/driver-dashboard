@@ -74,11 +74,15 @@ class BackupPromptTest {
         @Override
         ProcessResult runProcess(List<String> command) {
             commands.add(command);
-            return new ProcessResult(0, command.get(0).equals("powershell.exe") ? "oem42.inf" : "");
+            return new ProcessResult(0, isExe(command, "powershell.exe") ? "oem42.inf" : "");
         }
 
         List<List<String>> commands(String exe) {
-            return commands.stream().filter(c -> c.get(0).equals(exe)).toList();
+            return commands.stream().filter(c -> isExe(c, exe)).toList();
+        }
+
+        static boolean isExe(List<String> command, String exe) {
+            return Path.of(command.get(0)).getFileName().toString().equalsIgnoreCase(exe);
         }
     }
 
@@ -135,7 +139,7 @@ class BackupPromptTest {
 
         assertEquals(1, real.commands.size());
         List<String> cmd = real.commands.get(0);
-        assertEquals("pnputil.exe", cmd.get(0));
+        assertTrue(RecordingBackupService.isExe(cmd, "pnputil.exe"));
         assertEquals("/add-driver", cmd.get(1));
         Path staged = Path.of(cmd.get(2));
         // pnputil gets a private copy, so the validated original cannot be swapped underneath it
