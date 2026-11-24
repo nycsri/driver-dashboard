@@ -370,6 +370,13 @@
   .modal-path { font-family: var(--mono); font-size: 11px; color: var(--dim); word-break: break-all; }
   .modal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
 
+  .elevation-notice {
+    position: fixed; left: 16px; bottom: 16px; z-index: 50; max-width: 420px;
+    padding: 8px 12px; border: 1px solid var(--unknown); border-radius: 4px;
+    background: var(--surface); color: var(--unknown);
+    font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .toast, .badge.updating .badge-dot, .progress-bar-fill { animation: none; }
   }
@@ -922,6 +929,18 @@
     wrap.appendChild(t);
     setTimeout(() => t.remove(), action ? TOAST_ACTION_MS : TOAST_MS);
   }
+
+  (async function checkElevation() {
+    try {
+      const res = await fetch('/api/elevation', { cache: 'no-store' });
+      if (!res.ok || (await res.json()).elevated !== false) return;
+      const n = document.createElement('div');
+      n.className = 'elevation-notice';
+      n.setAttribute('role', 'alert');
+      n.textContent = 'Not running as Administrator — driver updates and rollback will fail. Restart with run-as-admin.cmd.';
+      document.body.appendChild(n);
+    } catch (e) { /* advisory only */ }
+  })();
 </script>
 </body>
 </html>
