@@ -72,7 +72,7 @@ mvn clean package
 java -jar target\driver-dashboard-1.0.0.jar
 ```
 
-Start the application from an elevated (Administrator) shell; driver installs, `pnputil` and firmware tools require it. Then open http://localhost:8080.
+Driver installs, `pnputil` and firmware tools need Administrator rights. The easiest way to start the app elevated is to double-click `run-as-admin.cmd` (or run `run-as-admin.ps1`): it shows a UAC prompt, builds the jar if needed and starts it. If you start it another way, use an elevated PowerShell. When the app is not elevated it logs a warning and the UI shows a banner; scanning still works but updates and rollback fail. Then open http://localhost:8080.
 
 ## Configuration
 
@@ -86,7 +86,7 @@ Set in `src/main/resources/application.properties`, or override on the command l
 | `logging.level.com.driverscanner` | `INFO` | Log level for application code. |
 | `driver.scan.schedule` | `0 0 2 * * ?` | Spring cron (sec min hour day month weekday) for the daily scan. |
 | `driver.backup.recent-days` | `7` | A backup younger than this is reused instead of exporting a new one. |
-| `driver.backup.root` | `${LOCALAPPDATA:}\DriverDashboard\Backups` | Backup folder, laid out as `<root>\<deviceId>\<timestamp>`. Startup fails if `LOCALAPPDATA` is unset and no absolute path is given. |
+| `driver.backup.root` | `${ProgramData:}\DriverDashboard\Backups` | Backup folder, laid out as `<root>\<deviceId>\<timestamp>`. Created with access limited to SYSTEM and Administrators. Startup fails if no absolute path is available. |
 | `driver.scan.ps-timeout-seconds` | `300` | Seconds before the Windows Update query PowerShell process is killed. |
 
 ## API
@@ -122,11 +122,11 @@ Base path: `/api/drivers`. `{deviceId}` is the stable hash returned in the `devi
 ## Security notes
 
 - **There is no authentication or authorization.** The app is intended for local use on a single machine.
-- **Bind address:** `application.properties` does not set `server.address`, so the embedded server uses the Spring Boot default and listens on all network interfaces (port 8080), not only localhost. Anyone who can reach the port can trigger scans, driver and firmware updates, and rollbacks. Do not expose port 8080 to a network; use a host firewall rule or add `server.address=127.0.0.1` yourself. Run it only on trusted machines and networks.
-- **No CSRF, Origin or Host checks:** state-changing endpoints (`POST /api/drivers/scan`, `/{id}/update`, scan-all) accept simple cross-origin requests, so a web page you visit, or a DNS-rebinding attack, could trigger them against a locally running instance. Run the app only while you are using it, and block port 8080 at the firewall.
+- **Bind address:** the server listens on `127.0.0.1` only (`server.address`), and every request must carry an allowed `Host` header (`driver.security.allowed-hosts`). Do not change the bind address or put the app behind a proxy or port forward.
+- **Request guard:** state-changing requests must send a per-start `X-DD-Token` header (from `GET /api/token`) and, if an `Origin` header is present, a same-host one. This blocks other websites and DNS rebinding, but not other programs running as you on the same machine, which can fetch the token. Local malware is out of scope; run the app only while you are using it.
 - **Administrator privileges:** the process must be elevated, so any request it accepts runs with Administrator rights, including PowerShell, `pnputil` and OEM tool invocations. On Dell systems a firmware update may suspend BitLocker and flash the BIOS.
 - **Runtime module install:** before the first update, if the PSWindowsUpdate module is missing, the app installs it from the PowerShell Gallery without pinning a version. Install and review the module yourself beforehand if that is a concern. PowerShell is launched with `-ExecutionPolicy Bypass`.
-- **Backup folder:** backups default to `%LOCALAPPDATA%\DriverDashboard\Backups`, which any process running as your user can write to. Rollback installs a package from there with Administrator rights. Point `driver.backup.root` at an Administrators-only folder.
+- **Backup folder:** backups live under `%ProgramData%` and are locked to SYSTEM and Administrators. Before a backup is reused or rolled back, the app checks the folder owner and permissions, refuses anything writable by other users, and installs from a private copy. This relies on running elevated and has not been exercised on every Windows configuration.
 - **Executables by bare name:** `powershell.exe` and `pnputil.exe` are launched without absolute paths. Do not start the app from a user-writable working directory.
 - **No request limits:** scans and updates are not serialised and have no timeouts on update, backup and OEM calls. Error responses may include tool output and local paths.
 - **Dependencies:** Spring Boot 3.2.0 is past end of life. No known CVE was found to be reachable in this application, but an upgrade is recommended before relying on it.
