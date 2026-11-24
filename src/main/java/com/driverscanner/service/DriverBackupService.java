@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -46,8 +47,9 @@ public class DriverBackupService {
     @Autowired
     public DriverBackupService(
             @Value("${driver.backup.root:}") String backupRoot,
-            @Value("${driver.backup.recent-days:7}") int recentDays) {
-        this(resolveRoot(backupRoot), recentDays, BackupAclGuard.windows());
+            @Value("${driver.backup.recent-days:7}") int recentDays,
+            @Value("${driver.backup.account-lookup-timeout-seconds:30}") long accountLookupTimeoutSeconds) {
+        this(resolveRoot(backupRoot), recentDays, BackupAclGuard.windows(Duration.ofSeconds(accountLookupTimeoutSeconds)));
     }
 
     DriverBackupService(Path backupRoot, int recentDays, BackupAclGuard aclGuard) {
@@ -60,6 +62,11 @@ public class DriverBackupService {
     public static class InsecureBackupException extends RuntimeException {
         public InsecureBackupException(String message) {
             super(message);
+        }
+
+        static InsecureBackupException at(Path path, String problem) {
+            return new InsecureBackupException(problem + ". To recover, an administrator should delete " + path
+                    + " (or reset its owner and permissions to SYSTEM/Administrators only); a fresh backup is created on the next update.");
         }
     }
 
@@ -94,15 +101,17 @@ public class DriverBackupService {
             throw new Exception("Could not locate INF for device: " + driver.getDeviceName());
         }
 
-        Path deviceDir = deviceBackupDir(driver.getDeviceId());
-        createSecured(deviceDir);
-        Path realDeviceDir = deviceDir.toRealPath();
-        aclGuard.requireSecure(backupRoot.toRealPath(), realDeviceDir);
+        String deviceFolder = deviceFolderName(driver.getDeviceId());
+        createSecured(backupRoot);
+        // the root is verified before the device folder is created in it, so that folder inherits a trusted ACL
+        Path realRoot = verifiedRoot();
+        createSecured(realRoot.resolve(deviceFolder));
+        Path realDeviceDir = verifiedDeviceDir(realRoot, deviceFolder);
 
         String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
         String backupPath = Files.createDirectories(realDeviceDir.resolve(timestamp)).toString();
 
-        ProcessResult result = runProcess(List.of("pnputil.exe", "/export-driver", infName, backupPath));
+        ProcessResult result = runProcess(List.of(SystemTools.path(SystemTools.PNPUTIL), "/export-driver", infName, backupPath));
         if (result.exitCode() != 0) {
             throw new Exception("pnputil /export-driver failed (exit " + result.exitCode() + "): " + result.output().trim());
         }
@@ -117,22 +126,26 @@ public class DriverBackupService {
      * strictly inside this device's backup folder (IllegalArgumentException otherwise).
      */
     public boolean rollbackDriver(String deviceId, String backupPath) throws Exception {
-        Path backupDir = resolveBackupPath(deviceId, backupPath);
-        Path realRoot = backupRoot.toRealPath();
-        Path realDeviceDir = deviceBackupDir(deviceId).toRealPath();
-        aclGuard.requireSecure(realRoot, realDeviceDir);
+        Path candidate = lexicalBackupPath(deviceId, backupPath);
+        Path realRoot = verifiedRoot();
+        Path realDeviceDir = verifiedDeviceDir(realRoot, deviceFolderName(deviceId));
+        Path backupDir = realInside(candidate, realDeviceDir);
 
         // pnputil gets a private copy taken after the checks, so the validated package cannot be swapped underneath it
-        Path staging = Files.createTempDirectory(realDeviceDir, STAGING_PREFIX).toRealPath();
+        Path staging = Files.createTempDirectory(realDeviceDir, STAGING_PREFIX);
         try {
-            copyTree(backupDir, staging);
-            aclGuard.requireSecure(realRoot, realDeviceDir, staging);
-            Path inf = findInfInBackup(staging, staging);
+            Path realStaging = staging.toRealPath();
+            if (!samePath(realStaging.getParent(), realDeviceDir)) {
+                throw InsecureBackupException.at(staging, "Rollback staging folder resolves to " + realStaging);
+            }
+            aclGuard.requireAdminOnly(realStaging);
+            copyTree(backupDir, realStaging);
+            Path inf = findInfInBackup(realStaging, realStaging);
             if (inf == null) {
                 throw new Exception("No .inf file found in backup: " + backupPath);
             }
 
-            ProcessResult result = runProcess(List.of("pnputil.exe", "/add-driver", inf.toString(), "/install"));
+            ProcessResult result = runProcess(List.of(SystemTools.path(SystemTools.PNPUTIL), "/add-driver", inf.toString(), "/install"));
             if (result.exitCode() != 0) {
                 throw new Exception("pnputil /add-driver failed (exit " + result.exitCode() + "): " + result.output().trim());
             }
@@ -147,22 +160,27 @@ public class DriverBackupService {
     /**
      * Creates any missing folders down to dir, locking each down before anything is placed in it.
      * Folders that already exist (an older build's, or one planted by another process) are left
-     * untouched and only ever used if BackupAclGuard accepts them.
+     * untouched and only ever used if BackupAclGuard accepts them; one that is a junction or link
+     * is refused outright, since anything created through it would land outside the checked tree.
      */
     private void createSecured(Path dir) throws Exception {
-        if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) return;
+        if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) {
+            rejectLink(dir);
+            return;
+        }
         Path parent = dir.getParent();
         if (parent != null) createSecured(parent);
         try {
             Files.createDirectory(dir);
         } catch (FileAlreadyExistsException raced) {
+            rejectLink(dir);
             return;
         }
         String admins = "*" + BackupAclGuard.ADMINISTRATORS_SID;
         for (List<String> args : List.of(
                 List.of("/inheritance:r", "/grant:r", "*" + BackupAclGuard.SYSTEM_SID + ":(OI)(CI)F", admins + ":(OI)(CI)F"),
                 List.of("/setowner", admins))) {
-            List<String> cmd = new ArrayList<>(List.of("icacls.exe", dir.toString()));
+            List<String> cmd = new ArrayList<>(List.of(SystemTools.path(SystemTools.ICACLS), dir.toString()));
             cmd.addAll(args);
             ProcessResult r = runProcess(cmd);
             if (r.exitCode() != 0) {
@@ -171,10 +189,52 @@ public class DriverBackupService {
                 throw new Exception("icacls could not secure " + dir + " (exit " + r.exitCode() + "): " + r.output().trim());
             }
         }
+        // anything placed here before the lock carries the inherited ACL, so it is not trusted
+        try (var entries = Files.list(dir)) {
+            if (entries.findAny().isPresent()) {
+                throw InsecureBackupException.at(dir, dir + " gained content before its permissions were locked");
+            }
+        }
     }
 
-    /** Copies without following links; any link or reparse point (e.g. a junction) aborts the rollback. */
-    private static void copyTree(Path src, Path dst) throws IOException {
+    private static void rejectLink(Path p) throws IOException {
+        BasicFileAttributes a = Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (a.isSymbolicLink() || a.isOther() || !a.isDirectory()) {
+            throw InsecureBackupException.at(p, p + " is a junction, link or non-folder");
+        }
+    }
+
+    /**
+     * The configured root, resolved once. It must be its own real path (no junction or link anywhere on
+     * it) and pass the ACL guard, so every later path derived from it stays inside the checked tree.
+     */
+    private Path verifiedRoot() throws IOException {
+        rejectLink(backupRoot);
+        Path real = backupRoot.toRealPath();
+        if (!samePath(real, backupRoot)) {
+            throw InsecureBackupException.at(backupRoot, backupRoot + " resolves to " + real + " through a junction or link");
+        }
+        aclGuard.requireSecure(backupRoot);
+        return real;
+    }
+
+    /** The device folder must be a plain admin-only folder directly inside the verified root. */
+    private Path verifiedDeviceDir(Path realRoot, String deviceFolder) throws IOException {
+        Path expected = realRoot.resolve(deviceFolder);
+        rejectLink(expected);
+        Path real = expected.toRealPath();
+        if (!samePath(real, expected) || !samePath(real.getParent(), realRoot)) {
+            throw InsecureBackupException.at(expected, expected + " resolves to " + real + ", outside the backup root");
+        }
+        aclGuard.requireAdminOnly(real);
+        return real;
+    }
+
+    /**
+     * Copies without following links; any link or reparse point (e.g. a junction) aborts the rollback,
+     * as does any entry a non-admin owns or can write, so a planted file never reaches pnputil.
+     */
+    private void copyTree(Path src, Path dst) throws IOException {
         Path realSrc = src.toRealPath();
         try (var stream = Files.walk(realSrc)) {
             for (Path p : (Iterable<Path>) stream::iterator) {
@@ -182,6 +242,7 @@ public class DriverBackupService {
                 if (a.isSymbolicLink() || a.isOther()) {
                     throw new IllegalArgumentException("Backup contains a link or reparse point: " + realSrc.relativize(p));
                 }
+                aclGuard.requireAdminOnly(p);
                 Path target = dst.resolve(realSrc.relativize(p).toString());
                 if (a.isDirectory()) Files.createDirectories(target);
                 else Files.copy(p, target, LinkOption.NOFOLLOW_LINKS);
@@ -202,11 +263,17 @@ public class DriverBackupService {
      * descendant of the given device's backup folder, including traversal, another
      * device's folder, and junction/symlink escapes.
      */
-    Path resolveBackupPath(String deviceId, String backupPath) {
+    Path resolveBackupPath(String deviceId, String backupPath) throws IOException {
+        Path candidate = lexicalBackupPath(deviceId, backupPath);
+        if (!Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)) return candidate;
+        return realInside(candidate, verifiedDeviceDir(verifiedRoot(), deviceFolderName(deviceId)));
+    }
+
+    private Path lexicalBackupPath(String deviceId, String backupPath) {
         if (backupPath == null || backupPath.isBlank()) {
             throw new IllegalArgumentException("backupPath is required");
         }
-        Path deviceDir = deviceBackupDir(deviceId);
+        Path deviceDir = backupRoot.resolve(deviceFolderName(deviceId));
         Path candidate;
         try {
             candidate = Path.of(backupPath).toAbsolutePath().normalize();
@@ -216,34 +283,40 @@ public class DriverBackupService {
         if (!isStrictlyInside(candidate, deviceDir)) {
             throw new IllegalArgumentException("backupPath is outside this device's backup directory");
         }
-        if (!Files.exists(candidate)) return candidate;
+        return candidate;
+    }
+
+    private static Path realInside(Path candidate, Path realDeviceDir) {
         Path real;
         try {
             real = candidate.toRealPath();
-            Path realDeviceDir = deviceDir.toRealPath();
-            if (!isStrictlyInside(realDeviceDir, backupRoot.toRealPath()) || !isStrictlyInside(real, realDeviceDir)) {
-                throw new IllegalArgumentException("backupPath is outside this device's backup directory");
-            }
-        } catch (java.io.IOException e) {
+        } catch (IOException e) {
             throw new IllegalArgumentException("backupPath could not be resolved", e);
+        }
+        if (!isStrictlyInside(real, realDeviceDir)) {
+            throw new IllegalArgumentException("backupPath is outside this device's backup directory");
         }
         return real;
     }
 
-    /** The device's own folder directly under the backup root; ids like ".." or "" cannot escape it. */
-    private Path deviceBackupDir(String deviceId) {
+    /** The device's folder name directly under the backup root; ids like ".." or "" cannot escape it. */
+    private String deviceFolderName(String deviceId) {
         if (deviceId == null || deviceId.isBlank()) {
             throw new IllegalArgumentException("deviceId is required");
         }
-        Path dir = backupRoot.resolve(sanitizeId(deviceId)).normalize();
-        if (!backupRoot.equals(dir.getParent())) {
+        String name = sanitizeId(deviceId);
+        if (!backupRoot.equals(backupRoot.resolve(name).normalize().getParent())) {
             throw new IllegalArgumentException("deviceId does not map to a backup folder");
         }
-        return dir;
+        return name;
     }
 
     private static boolean isStrictlyInside(Path candidate, Path root) {
         return candidate.startsWith(root) && !candidate.equals(root);
+    }
+
+    private static boolean samePath(Path a, Path b) {
+        return a != null && b != null && a.toString().equalsIgnoreCase(b.toString());
     }
 
     public BackupStatus getBackupStatus(Driver driver) {
@@ -259,17 +332,16 @@ public class DriverBackupService {
      */
     public String findRecentBackup(Driver driver) {
         try {
-            Path deviceDir = deviceBackupDir(driver.getDeviceId());
-            if (!Files.exists(deviceDir)) return null;
-            Path deviceBackupDir = deviceDir.toRealPath();
-            aclGuard.requireSecure(backupRoot.toRealPath(), deviceBackupDir);
+            String deviceFolder = deviceFolderName(driver.getDeviceId());
+            if (!Files.exists(backupRoot.resolve(deviceFolder), LinkOption.NOFOLLOW_LINKS)) return null;
+            Path deviceBackupDir = verifiedDeviceDir(verifiedRoot(), deviceFolder);
 
             DateTimeFormatter fmt = TIMESTAMP_FMT;
             LocalDateTime cutoff = LocalDateTime.now().minusDays(recentDays);
 
             try (var stream = Files.list(deviceBackupDir)) {
                 return stream
-                    .filter(Files::isDirectory)
+                    .filter(p -> Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS))
                     .filter(p -> {
                         try {
                             return LocalDateTime.parse(p.getFileName().toString(), fmt).isAfter(cutoff);
@@ -295,7 +367,7 @@ public class DriverBackupService {
             """, escapeForPowerShell(lookupId));
 
         ProcessResult result = runProcess(List.of(
-            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd));
+            SystemTools.path(SystemTools.POWERSHELL), "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd));
         return result.output().lines().map(String::trim).filter(l -> !l.isEmpty()).findFirst().orElse("NONE");
     }
 

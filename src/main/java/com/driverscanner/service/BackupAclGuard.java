@@ -15,10 +15,12 @@ import java.nio.file.attribute.AclEntryType;
 import java.nio.file.attribute.AclFileAttributeView;
 import java.nio.file.attribute.UserPrincipal;
 import java.nio.file.attribute.UserPrincipalLookupService;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static java.nio.file.attribute.AclEntryPermission.*;
@@ -59,24 +61,31 @@ class BackupAclGuard {
         this.reader = reader;
     }
 
-    static BackupAclGuard windows() {
-        return new BackupAclGuard(BackupAclGuard::resolveWellKnown, BackupAclGuard::readNio);
+    static BackupAclGuard windows(Duration lookupTimeout) {
+        return new BackupAclGuard(() -> resolveWellKnown(lookupTimeout), BackupAclGuard::readNio);
     }
 
     /**
-     * The root and each given folder must be owned by SYSTEM/Administrators and writable by nobody
-     * else; the root's ancestors must not let anyone else rename, replace or re-permission it.
-     * Pass real paths. Throws InsecureBackupException otherwise.
+     * The root must be owned by SYSTEM/Administrators and writable by nobody else, and its ancestors
+     * must not let anyone else rename, replace or re-permission it. Pass the configured root once the
+     * caller has confirmed it is its own real path, so the ancestors walked are the configured ones.
+     * Each given folder is then checked like {@link #requireAdminOnly}.
      */
-    void requireSecure(Path realRoot, Path... realDirs) {
+    void requireSecure(Path root, Path... dirs) {
         Trust t = trust();
-        Set<UserPrincipal> adminOwners = Set.of(t.system(), t.administrators());
         Set<UserPrincipal> ancestorOwners = Set.of(t.system(), t.administrators(), t.trustedInstaller());
-        for (Path a = realRoot.getParent(); a != null; a = a.getParent()) {
+        for (Path a = root.getParent(); a != null; a = a.getParent()) {
             check(a, ancestorOwners, TAKEOVER, false, t);
         }
-        check(realRoot, adminOwners, WRITE, true, t);
-        for (Path d : realDirs) check(d, adminOwners, WRITE, true, t);
+        check(root, Set.of(t.system(), t.administrators()), WRITE, true, t);
+        requireAdminOnly(dirs);
+    }
+
+    /** Each folder or file must be owned by SYSTEM/Administrators and writable by nobody else. */
+    void requireAdminOnly(Path... paths) {
+        Trust t = trust();
+        Set<UserPrincipal> adminOwners = Set.of(t.system(), t.administrators());
+        for (Path p : paths) check(p, adminOwners, WRITE, true, t);
     }
 
     private void check(Path dir, Set<UserPrincipal> owners, Set<AclEntryPermission> forbidden, boolean strict, Trust t) {
@@ -84,10 +93,10 @@ class BackupAclGuard {
         try {
             acl = reader.read(dir);
         } catch (IOException e) {
-            throw new DriverBackupService.InsecureBackupException("Cannot read the permissions of " + dir + ": " + e.getMessage());
+            throw DriverBackupService.InsecureBackupException.at(dir, "Cannot read the permissions of " + dir + ": " + e.getMessage());
         }
         if (!owners.contains(acl.owner())) {
-            throw new DriverBackupService.InsecureBackupException(
+            throw DriverBackupService.InsecureBackupException.at(dir,
                     dir + " is owned by " + acl.owner().getName() + ", not SYSTEM or Administrators");
         }
         Set<UserPrincipal> trusted = Set.of(t.system(), t.administrators(), t.trustedInstaller(), t.creatorOwner());
@@ -97,7 +106,7 @@ class BackupAclGuard {
             boolean grants = !Collections.disjoint(e.permissions(), forbidden);
             // Inherit-only ACEs keep generic rights that AclEntry cannot decode, so on backup folders they are refused outright.
             if (strict ? inheritOnly || grants : !inheritOnly && grants) {
-                throw new DriverBackupService.InsecureBackupException(
+                throw DriverBackupService.InsecureBackupException.at(dir,
                         dir + " can be modified by " + e.principal().getName() + "; only SYSTEM and Administrators may write backup folders");
             }
         }
@@ -119,18 +128,23 @@ class BackupAclGuard {
     }
 
     /** LookupAccountName rejects SID strings, so the OS translates them to (localised) account names first. */
-    private static Trust resolveWellKnown() {
+    private static Trust resolveWellKnown(Duration timeout) {
         String script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; '" + String.join("','",
                 SYSTEM_SID, ADMINISTRATORS_SID, TRUSTED_INSTALLER_SID, CREATOR_OWNER_SID)
                 + "' | ForEach-Object { ([Security.Principal.SecurityIdentifier]$_).Translate([Security.Principal.NTAccount]).Value }";
+        Process p = null;
         try {
-            Process p = new ProcessBuilder("powershell.exe", "-NonInteractive", "-NoProfile", "-Command", script)
+            p = new ProcessBuilder(SystemTools.path(SystemTools.POWERSHELL), "-NonInteractive", "-NoProfile", "-Command", script)
                     .redirectErrorStream(true).start();
+            // the four account names fit in the pipe buffer, so waiting before reading cannot deadlock
+            if (!p.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("account lookup timed out after " + timeout.toSeconds() + " s");
+            }
             List<String> names;
             try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 names = r.lines().map(String::trim).filter(l -> !l.isEmpty()).toList();
             }
-            if (p.waitFor() != 0 || names.size() != 4) {
+            if (p.exitValue() != 0 || names.size() != 4) {
                 throw new IllegalStateException("unexpected output: " + names);
             }
             UserPrincipalLookupService lookup = FileSystems.getDefault().getUserPrincipalLookupService();
@@ -140,6 +154,8 @@ class BackupAclGuard {
             if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new DriverBackupService.InsecureBackupException(
                     "Cannot resolve the SYSTEM/Administrators accounts to verify backup folder permissions: " + e.getMessage());
+        } finally {
+            if (p != null && p.isAlive()) p.destroyForcibly();
         }
     }
 }

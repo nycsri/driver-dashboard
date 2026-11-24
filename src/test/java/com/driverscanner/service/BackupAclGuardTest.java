@@ -107,6 +107,6 @@ class BackupAclGuardTest {
     @Test
     @EnabledOnOs(OS.WINDOWS)
     void realUserOwnedTempFolderIsRejected(@TempDir Path tmp) throws Exception {
-        assertThrows(InsecureBackupException.class, () -> BackupAclGuard.windows().requireSecure(tmp.toRealPath()));
+        assertThrows(InsecureBackupException.class, () -> BackupAclGuard.windows(java.time.Duration.ofSeconds(60)).requireSecure(tmp.toRealPath()));
     }
 }
