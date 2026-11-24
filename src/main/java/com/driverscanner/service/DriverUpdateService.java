@@ -22,26 +22,45 @@ public class DriverUpdateService {
 
     private static final Logger log = LoggerFactory.getLogger(DriverUpdateService.class);
 
-    @Autowired private AntivirusService antivirusService;
-    @Autowired private DriverBackupService backupService;
-    @Autowired private OemUpdateService oemUpdateService;
+    private final AntivirusService antivirusService;
+    private final DriverBackupService backupService;
+    private final OemUpdateService oemUpdateService;
+
+    @Autowired
+    public DriverUpdateService(AntivirusService antivirusService, DriverBackupService backupService,
+                               OemUpdateService oemUpdateService) {
+        this.antivirusService = antivirusService;
+        this.backupService = backupService;
+        this.oemUpdateService = oemUpdateService;
+    }
+
+    record ProcessOutput(int exitCode, String output) {}
+
+    /**
+     * Firmware devices cannot be backed up via pnputil (no INF package) and must
+     * go through OEM tooling.
+     */
+    public static boolean isFirmware(Driver driver) {
+        return "Firmware".equals(driver.getDeviceClass())
+            || (driver.getDeviceName() != null
+                && driver.getDeviceName().toUpperCase().startsWith("MICROSOFT UEFI"));
+    }
+
+    public UpdateResult triggerUpdate(Driver driver, boolean forceWithoutBackup) {
+        return triggerUpdate(driver, true, forceWithoutBackup);
+    }
 
     /**
      * Triggers a silent driver update for the given driver via PSWindowsUpdate.
-     * Backs up the current driver INF first so it can be rolled back if needed.
      *
-     * If the backup fails and forceWithoutBackup is false, returns an UpdateResult
-     * with requiresConfirmation=true — the caller must re-invoke with forceWithoutBackup=true
-     * to proceed without a backup (explicit user approval).
+     * backup=false is the user's explicit choice to skip the backup. With backup=true the
+     * current driver INF is exported first (or a recent backup reused); if that fails and
+     * forceWithoutBackup is false, returns requiresConfirmation=true and installs nothing.
      */
-    public UpdateResult triggerUpdate(Driver driver, boolean forceWithoutBackup) {
+    public UpdateResult triggerUpdate(Driver driver, boolean backup, boolean forceWithoutBackup) {
         log.info("Triggering update for: " + driver.getDeviceName());
 
-        // Firmware devices cannot be backed up via pnputil (no INF package) and must
-        // go through OEM tooling - bypass the backup + PSWindowsUpdate path entirely.
-        if ("Firmware".equals(driver.getDeviceClass())
-                || (driver.getDeviceName() != null
-                    && driver.getDeviceName().toUpperCase().startsWith("MICROSOFT UEFI"))) {
+        if (isFirmware(driver)) {
             return oemUpdateService.triggerFirmwareUpdate(driver);
         }
 
@@ -53,8 +72,10 @@ public class DriverUpdateService {
                 driver.getDeviceName() + " is a built-in Windows component and cannot be updated.");
         }
 
-        String backupPath = backupService.findRecentBackup(driver);
-        if (backupPath != null) {
+        String backupPath = backup ? backupService.findRecentBackup(driver) : null;
+        if (!backup) {
+            log.info("User chose to update " + driver.getDeviceName() + " without a backup.");
+        } else if (backupPath != null) {
             log.info("Recent backup found for " + driver.getDeviceName() + " at " + backupPath + " - skipping new backup.");
         } else {
             try {
@@ -101,24 +122,9 @@ public class DriverUpdateService {
                 """, escapeForPowerShell(driver.getDeviceName()));
 
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe", "-NonInteractive", "-NoProfile",
-                "-ExecutionPolicy", "Bypass", "-Command", psCmd
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                }
-            }
-
-            int exitCode = process.waitFor();
-            String fullOutput = output.toString();
+            ProcessOutput ps = runPowerShell(psCmd);
+            int exitCode = ps.exitCode();
+            String fullOutput = ps.output();
             log.info("PSWindowsUpdate output for '{}':\n{}", driver.getDeviceName(), fullOutput.trim());
 
             // PSWindowsUpdate often prints status lines before our marker — scan line by line.
@@ -215,6 +221,25 @@ public class DriverUpdateService {
         } catch (Exception e) {
             return new UpdateResult("ALL", false, "pnputil error: " + e.getMessage());
         }
+    }
+
+    ProcessOutput runPowerShell(String script) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+            "powershell.exe", "-NonInteractive", "-NoProfile",
+            "-ExecutionPolicy", "Bypass", "-Command", script
+        );
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+
+        StringBuilder output = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+        }
+        return new ProcessOutput(process.waitFor(), output.toString());
     }
 
     private boolean isVirtualWindowsDriver(Driver driver) {

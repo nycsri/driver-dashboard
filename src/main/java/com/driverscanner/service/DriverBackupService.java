@@ -1,6 +1,8 @@
 package com.driverscanner.service;
 
 import com.driverscanner.model.Driver;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
@@ -22,7 +24,22 @@ import java.util.logging.Logger;
 public class DriverBackupService {
 
     private static final Logger log = Logger.getLogger(DriverBackupService.class.getName());
-    private static final String BACKUP_ROOT = System.getenv("LOCALAPPDATA") + "\\DriverDashboard\\Backups";
+    private static final DateTimeFormatter TIMESTAMP_FMT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+
+    private final Path backupRoot;
+    private final int recentDays;
+
+    @Autowired
+    public DriverBackupService(@Value("${driver.backup.recent-days:7}") int recentDays) {
+        this(Path.of(System.getenv("LOCALAPPDATA") + "\\DriverDashboard\\Backups"), recentDays);
+    }
+
+    DriverBackupService(Path backupRoot, int recentDays) {
+        this.backupRoot = backupRoot.toAbsolutePath().normalize();
+        this.recentDays = recentDays;
+    }
+
+    public record BackupStatus(boolean hasRecentBackup, String backupPath, LocalDateTime timestamp) {}
 
     /**
      * Exports the current driver package for the given device to a timestamped backup folder.
@@ -34,8 +51,8 @@ public class DriverBackupService {
             throw new Exception("Could not locate INF for device: " + driver.getDeviceName());
         }
 
-        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-        String backupPath = BACKUP_ROOT + "\\" + sanitizeId(driver.getDeviceId()) + "\\" + timestamp;
+        String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
+        String backupPath = backupRoot.resolve(sanitizeId(driver.getDeviceId())).resolve(timestamp).toString();
         Files.createDirectories(Path.of(backupPath));
 
         ProcessBuilder pb = new ProcessBuilder("pnputil.exe", "/export-driver", infName, backupPath);
@@ -59,10 +76,11 @@ public class DriverBackupService {
 
     /**
      * Rolls back a driver by re-installing the backed-up INF package via pnputil.
-     * Returns true on success.
+     * Returns true on success. The path comes from the client, so it must resolve
+     * strictly inside the backup root (IllegalArgumentException otherwise).
      */
     public boolean rollbackDriver(String backupPath) throws Exception {
-        Path inf = findInfInBackup(backupPath);
+        Path inf = findInfInBackup(resolveBackupPath(backupPath));
         if (inf == null) {
             throw new Exception("No .inf file found in backup: " + backupPath);
         }
@@ -87,16 +105,52 @@ public class DriverBackupService {
     }
 
     /**
+     * Normalises a client-supplied backup path and rejects anything that is not a
+     * descendant of the backup root, including traversal and junction/symlink escapes.
+     */
+    Path resolveBackupPath(String backupPath) {
+        if (backupPath == null || backupPath.isBlank()) {
+            throw new IllegalArgumentException("backupPath is required");
+        }
+        Path candidate = Path.of(backupPath).toAbsolutePath().normalize();
+        if (!isStrictlyInside(candidate, backupRoot)) {
+            throw new IllegalArgumentException("backupPath is outside the backup directory");
+        }
+        if (!Files.exists(candidate)) return candidate;
+        Path real;
+        try {
+            real = candidate.toRealPath();
+            if (!isStrictlyInside(real, backupRoot.toRealPath())) {
+                throw new IllegalArgumentException("backupPath is outside the backup directory");
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalArgumentException("backupPath could not be resolved", e);
+        }
+        return real;
+    }
+
+    private static boolean isStrictlyInside(Path candidate, Path root) {
+        return candidate.startsWith(root) && !candidate.equals(root);
+    }
+
+    public BackupStatus getBackupStatus(Driver driver) {
+        String path = findRecentBackup(driver);
+        if (path == null) return new BackupStatus(false, null, null);
+        return new BackupStatus(true, path,
+            LocalDateTime.parse(Path.of(path).getFileName().toString(), TIMESTAMP_FMT));
+    }
+
+    /**
      * Returns the path of the most recent backup for this driver if one exists
-     * within the last 7 days, or null otherwise.
+     * within the last driver.backup.recent-days days, or null otherwise.
      */
     public String findRecentBackup(Driver driver) {
         try {
-            Path deviceBackupDir = Path.of(BACKUP_ROOT, sanitizeId(driver.getDeviceId()));
+            Path deviceBackupDir = backupRoot.resolve(sanitizeId(driver.getDeviceId()));
             if (!Files.exists(deviceBackupDir)) return null;
 
-            DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
-            LocalDateTime cutoff = LocalDateTime.now().minusDays(7);
+            DateTimeFormatter fmt = TIMESTAMP_FMT;
+            LocalDateTime cutoff = LocalDateTime.now().minusDays(recentDays);
 
             try (var stream = Files.list(deviceBackupDir)) {
                 return stream
@@ -139,8 +193,8 @@ public class DriverBackupService {
         return result;
     }
 
-    private Path findInfInBackup(String backupPath) throws Exception {
-        try (var stream = Files.walk(Path.of(backupPath), 2)) {
+    private Path findInfInBackup(Path backupPath) throws Exception {
+        try (var stream = Files.walk(backupPath, 2)) {
             return stream.filter(p -> p.toString().endsWith(".inf")).findFirst().orElse(null);
         }
     }

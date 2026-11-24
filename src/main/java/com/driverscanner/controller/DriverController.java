@@ -58,10 +58,11 @@ public class DriverController {
      * POST /api/drivers/{deviceId}/update
      * Triggers a silent driver update via PSWindowsUpdate for the given device.
      *
-     * Optional body: { "forceWithoutBackup": true }
+     * Optional body: { "backup": true|false, "forceWithoutBackup": true }
+     * backup defaults to true; backup=false is the user's explicit choice to skip it.
      * If backup fails and forceWithoutBackup is absent/false, returns HTTP 409 with
-     * requiresConfirmation=true. Re-send with forceWithoutBackup=true to approve
-     * proceeding without a backup.
+     * requiresConfirmation=true. Re-send with backup=false (or forceWithoutBackup=true)
+     * to approve proceeding without a backup.
      */
     @PostMapping("/{deviceId}/update")
     public ResponseEntity<UpdateResult> updateDriver(
@@ -74,15 +75,18 @@ public class DriverController {
 
         boolean forceWithoutBackup = body != null
             && Boolean.TRUE.equals(body.get("forceWithoutBackup"));
+        boolean backup = body == null || !Boolean.FALSE.equals(body.get("backup"));
 
         String versionBefore = driver.getDriverVersion();
+        Driver.Status statusBefore = driver.getStatus();
         driver.setStatus(Driver.Status.UPDATING);
         orchestration.putDriver(deviceId, driver);
 
-        UpdateResult result = updateService.triggerUpdate(driver, forceWithoutBackup);
+        UpdateResult result = updateService.triggerUpdate(driver, backup, forceWithoutBackup);
 
         if (result.isRequiresConfirmation()) {
-            driver.setStatus(Driver.Status.UNKNOWN);
+            // Keep the pre-update status so the Update action stays available if the user declines.
+            driver.setStatus(statusBefore);
             driver.setStatusMessage("Backup failed — awaiting user confirmation.");
             orchestration.putDriver(deviceId, driver);
             return ResponseEntity.status(409).body(result);
@@ -133,6 +137,28 @@ public class DriverController {
     }
 
     /**
+     * GET /api/drivers/{deviceId}/backup-status
+     * Tells the update dialog whether a recent backup exists and whether the device is firmware.
+     */
+    @GetMapping("/{deviceId}/backup-status")
+    public ResponseEntity<?> backupStatus(@PathVariable String deviceId) {
+        Driver driver = orchestration.getDriver(deviceId);
+        if (driver == null) {
+            return ResponseEntity.notFound().build();
+        }
+        boolean firmware = DriverUpdateService.isFirmware(driver);
+        var status = firmware
+            ? new DriverBackupService.BackupStatus(false, null, null)
+            : backupService.getBackupStatus(driver);
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("hasRecentBackup", status.hasRecentBackup());
+        body.put("backupPath", status.backupPath());
+        body.put("timestamp", status.timestamp() == null ? null : status.timestamp().toString());
+        body.put("firmware", firmware);
+        return ResponseEntity.ok(body);
+    }
+
+    /**
      * POST /api/drivers/{deviceId}/rollback
      * Rolls back a driver to the backed-up version.
      * Body: { "backupPath": "C:\\...\\DriverDashboard\\Backups\\...\\20240101_120000" }
@@ -154,6 +180,8 @@ public class DriverController {
                 orchestration.putDriver(deviceId, driver);
             }
             return ResponseEntity.ok(Map.of("success", true, "backupPath", backupPath));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Rollback failed: " + e.getMessage()));

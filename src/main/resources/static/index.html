@@ -328,6 +328,51 @@
     from { transform: translateX(100%); opacity: 0; }
     to   { transform: translateX(0);   opacity: 1; }
   }
+  .toast-msg { word-break: break-word; }
+  .toast-action { margin-top: 10px; padding: 4px 12px; }
+
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .action-cell { display: flex; gap: 6px; }
+
+  /* DIALOG */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(10,12,15,0.85);
+    z-index: 400;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    width: 100%;
+    max-width: 480px;
+    padding: 24px;
+  }
+  .modal-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 16px;
+  }
+  .modal-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.5; }
+  .modal-meta { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .modal-meta.strong { color: #e2e8f0; font-family: var(--sans); font-size: 14px; font-weight: 600; }
+  .modal-note { font-size: 12px; color: var(--good); }
+  .modal-warn { font-size: 12px; color: var(--unknown); }
+  .modal-path { font-family: var(--mono); font-size: 11px; color: var(--dim); word-break: break-all; }
+  .modal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .toast, .badge.updating .badge-dot, .progress-bar-fill { animation: none; }
+  }
 </style>
 </head>
 <body>
@@ -424,7 +469,16 @@
 </div>
 
 <!-- TOASTS -->
-<div class="toast-wrap" id="toastWrap"></div>
+<div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
+
+<!-- DIALOG -->
+<div class="modal-backdrop" id="dialog" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialogTitle" aria-describedby="dialogBody">
+    <h2 class="modal-title" id="dialogTitle"></h2>
+    <div class="modal-body" id="dialogBody"></div>
+    <div class="modal-actions" id="dialogActions"></div>
+  </div>
+</div>
 
 <script>
   let allDrivers = [];
@@ -462,17 +516,97 @@
   }
 
   // ── UPDATE SINGLE DRIVER ──────────────────────────────────────────────────
+  const driverUrl = id => '/api/drivers/' + encodeURIComponent(id);
+
   async function updateDriver(deviceId) {
+    const d = allDrivers.find(x => x.deviceId === deviceId);
+    if (!d) return;
+
+    const status = await fetchBackupStatus(deviceId);
+    const choice = status.firmware ? await firmwareDialog(d) : await backupDialog(d, status);
+    if (!choice) return;
+    await runUpdate(deviceId, choice === 'backup');
+  }
+
+  async function fetchBackupStatus(deviceId) {
+    try {
+      const res = await fetch(driverUrl(deviceId) + '/backup-status');
+      if (!res.ok) throw new Error(res.statusText);
+      return await res.json();
+    } catch (_) {
+      return { firmware: false, hasRecentBackup: false, unavailable: true };
+    }
+  }
+
+  function driverLines(d) {
+    return [
+      { text: d.deviceName || '—', cls: 'modal-meta strong' },
+      { text: 'Installed version: ' + (d.driverVersion || '—'), cls: 'modal-meta' },
+    ];
+  }
+
+  function backupDialog(d, status) {
+    const lines = driverLines(d);
+    if (status.hasRecentBackup) {
+      const when = status.timestamp ? new Date(status.timestamp).toLocaleString() : 'recently';
+      lines.push({ text: 'A recent backup from ' + when + ' exists and will be reused.', cls: 'modal-note' });
+    } else if (status.unavailable) {
+      lines.push({ text: 'Backup status could not be checked.', cls: 'modal-warn' });
+    }
+    return openDialog({
+      title: 'Back up the current driver before updating?',
+      lines,
+      buttons: [
+        { label: 'Cancel', value: null },
+        { label: 'Update without backup', value: 'skip' },
+        { label: 'Back up & update', value: 'backup', kind: 'primary', autofocus: true },
+      ],
+    });
+  }
+
+  function firmwareDialog(d) {
+    return openDialog({
+      title: 'Update firmware?',
+      lines: [
+        ...driverLines(d),
+        'Firmware has no driver package to back up. It is updated through the vendor\'s tooling.',
+      ],
+      buttons: [
+        { label: 'Cancel', value: null },
+        { label: 'Update', value: 'update', kind: 'primary', autofocus: true },
+      ],
+    });
+  }
+
+  async function runUpdate(deviceId, backup) {
     const btn = document.getElementById('btn-' + deviceId);
     if (btn) { btn.disabled = true; btn.textContent = 'UPDATING...'; }
 
-    // Optimistically update status in store
     const d = allDrivers.find(x => x.deviceId === deviceId);
+    const before = d && { status: d.status, statusMessage: d.statusMessage };
     if (d) { d.status = 'UPDATING'; renderTable(); }
 
     try {
-      const res = await fetch('/api/drivers/' + encodeURIComponent(deviceId) + '/update', { method: 'POST' });
+      const res = await fetch(driverUrl(deviceId) + '/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backup }),
+      });
       const result = await res.json();
+
+      if (res.status === 409 && result.requiresConfirmation) {
+        if (d) { Object.assign(d, before); renderTable(); }
+        const proceed = await openDialog({
+          title: 'Backup failed',
+          lines: ['Backup failed: ' + (result.backupError || result.message) + '. Update anyway without a backup?'],
+          buttons: [
+            { label: 'Cancel', value: null, autofocus: true },
+            { label: 'Update without backup', value: 'go', kind: 'danger' },
+          ],
+        });
+        if (proceed) await runUpdate(deviceId, false);
+        return;
+      }
 
       let msg = result.message;
       if (d) {
@@ -493,13 +627,122 @@
           d.status = 'UPDATE_FAILED';
           d.statusMessage = result.message;
         }
+        if (result.success && result.backupPath) d.lastBackupPath = result.backupPath;
         renderTable();
       }
-      toast(msg, d && d.status !== 'UPDATE_FAILED' ? 'success' : 'error');
+      if (result.success && result.backupPath) {
+        const path = result.backupPath;
+        toast(msg + ' — Backed up to ' + path, 'success',
+          { label: 'Rollback', onClick: () => rollbackDriver(deviceId, path) });
+      } else {
+        toast(msg, d && d.status !== 'UPDATE_FAILED' ? 'success' : 'error');
+      }
     } catch (e) {
       if (d) { d.status = 'UPDATE_FAILED'; d.statusMessage = e.message; renderTable(); }
       toast('Update failed: ' + e.message, 'error');
     }
+  }
+
+  // ── ROLLBACK ──────────────────────────────────────────────────────────────
+  async function rollbackDriver(deviceId, backupPath) {
+    const d = allDrivers.find(x => x.deviceId === deviceId);
+    const ok = await openDialog({
+      title: 'Roll back driver?',
+      lines: [
+        ...(d ? driverLines(d) : []),
+        'Reinstall the driver package backed up to:',
+        { text: backupPath, cls: 'modal-path' },
+      ],
+      buttons: [
+        { label: 'Cancel', value: null },
+        { label: 'Roll back', value: 'go', kind: 'primary', autofocus: true },
+      ],
+    });
+    if (!ok) return;
+
+    try {
+      const res = await fetch(driverUrl(deviceId) + '/rollback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backupPath }),
+      });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || res.statusText);
+      await refreshDriver(deviceId);
+      toast('Rolled back from ' + backupPath, 'success');
+    } catch (e) {
+      toast('Rollback failed: ' + e.message, 'error');
+    }
+  }
+
+  async function refreshDriver(deviceId) {
+    try {
+      const fresh = await (await fetch('/api/drivers')).json();
+      const f = fresh.find(x => x.deviceId === deviceId);
+      const d = allDrivers.find(x => x.deviceId === deviceId);
+      if (d && f) { Object.assign(d, f); renderTable(); }
+    } catch (_) { /* row keeps its last known state */ }
+  }
+
+  // ── DIALOG ────────────────────────────────────────────────────────────────
+  // Resolves with the chosen button's value, or null on Cancel / Esc / backdrop click.
+  function openDialog({ title, lines, buttons }) {
+    const root = document.getElementById('dialog');
+    const box = root.querySelector('.modal');
+    const opener = document.activeElement;
+
+    document.getElementById('dialogTitle').textContent = title;
+    document.getElementById('dialogBody').replaceChildren(...lines.map(line => {
+      const p = document.createElement('p');
+      if (typeof line === 'string') {
+        p.textContent = line;
+      } else {
+        p.textContent = line.text;
+        p.className = line.cls;
+      }
+      return p;
+    }));
+
+    return new Promise(resolve => {
+      const btns = buttons.map(b => {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'btn' + (b.kind ? ' btn-' + b.kind : '');
+        el.textContent = b.label;
+        el.addEventListener('click', () => close(b.value));
+        return el;
+      });
+      document.getElementById('dialogActions').replaceChildren(...btns);
+
+      const onKey = e => {
+        if (e.key === 'Escape') { e.preventDefault(); close(null); return; }
+        if (e.key !== 'Tab') return;
+        const first = btns[0], last = btns[btns.length - 1];
+        if (!box.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+        else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      };
+      const onBackdrop = e => { if (e.target === root) close(null); };
+
+      function setBackgroundInert(on) {
+        for (const el of document.body.children) if (el !== root) el.inert = on;
+      }
+
+      function close(value) {
+        document.removeEventListener('keydown', onKey, true);
+        root.removeEventListener('click', onBackdrop);
+        root.hidden = true;
+        setBackgroundInert(false);
+        if (opener && opener.isConnected) opener.focus();
+        resolve(value);
+      }
+
+      document.addEventListener('keydown', onKey, true);
+      root.addEventListener('click', onBackdrop);
+      setBackgroundInert(true);
+      root.hidden = false;
+      (btns[buttons.findIndex(b => b.autofocus)] || btns[btns.length - 1]).focus();
+    });
   }
 
   // ── PNPUTIL SCAN ALL ──────────────────────────────────────────────────────
@@ -572,15 +815,33 @@
   }
 
   function actionBtn(d) {
-    if (d.status === 'STALE' || d.status === 'UPDATE_FAILED') {
-      return `<button class="btn btn-danger" id="btn-${d.deviceId}"
-        onclick="updateDriver('${esc(d.deviceId)}')">UPDATE</button>`;
-    }
     if (d.status === 'UPDATING') {
-      return `<button class="btn" disabled id="btn-${d.deviceId}">UPDATING...</button>`;
+      return `<button class="btn" disabled id="btn-${esc(d.deviceId)}">UPDATING...</button>`;
     }
-    return `<span style="color:var(--dim);font-family:var(--mono);font-size:11px">—</span>`;
+    const parts = [];
+    if (d.status === 'STALE' || d.status === 'UPDATE_FAILED') {
+      parts.push(`<button class="btn btn-danger" id="btn-${esc(d.deviceId)}"
+        data-update="${esc(d.deviceId)}">UPDATE</button>`);
+    }
+    if (d.lastBackupPath) {
+      parts.push(`<button class="btn" data-rollback="${esc(d.deviceId)}"
+        title="${esc('Backed up to ' + d.lastBackupPath)}">ROLLBACK</button>`);
+    }
+    if (!parts.length) {
+      return `<span style="color:var(--dim);font-family:var(--mono);font-size:11px">—</span>`;
+    }
+    return `<div class="action-cell">${parts.join('')}</div>`;
   }
+
+  // Delegated so device IDs never get interpolated into inline JS handlers.
+  document.getElementById('tableBody').addEventListener('click', e => {
+    const upd = e.target.closest('[data-update]');
+    if (upd) { updateDriver(upd.dataset.update); return; }
+    const rb = e.target.closest('[data-rollback]');
+    if (!rb) return;
+    const d = allDrivers.find(x => x.deviceId === rb.dataset.rollback);
+    if (d && d.lastBackupPath) rollbackDriver(d.deviceId, d.lastBackupPath);
+  });
 
   function updateStats(total, stale, good, unknown) {
     document.getElementById('statTotal').textContent   = total   ?? '—';
@@ -615,13 +876,27 @@
     document.getElementById('scanBtn').disabled = on;
   }
 
-  function toast(msg, type) {
+  const TOAST_MS = 5000;
+  const TOAST_ACTION_MS = 15000;
+
+  function toast(msg, type, action) {
     const wrap = document.getElementById('toastWrap');
     const t = document.createElement('div');
     t.className = 'toast ' + (type || '');
-    t.textContent = msg;
+    const text = document.createElement('div');
+    text.className = 'toast-msg';
+    text.textContent = msg;
+    t.appendChild(text);
+    if (action) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn toast-action';
+      b.textContent = action.label;
+      b.addEventListener('click', () => { t.remove(); action.onClick(); });
+      t.appendChild(b);
+    }
     wrap.appendChild(t);
-    setTimeout(() => t.remove(), 5000);
+    setTimeout(() => t.remove(), action ? TOAST_ACTION_MS : TOAST_MS);
   }
 </script>
 </body>
