@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Driver Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #0a0c0f;
+    --surface:  #111418;
+    --border:   #1e2430;
+    --muted:    #2c3344;
+    --text:     #c8d0e0;
+    --dim:      #5a6478;
+    --accent:   #3b82f6;
+    --stale:    #ef4444;
+    --good:     #22c55e;
+    --unknown:  #f59e0b;
+    --updating: #8b5cf6;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  /* TOP BAR */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 28px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 14px; }
+  .logo {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .logo span { color: var(--dim); font-weight: 400; }
+  .system-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 2px;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 10px; }
+
+  /* BUTTONS */
+  .btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    padding: 7px 16px;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn-danger { border-color: var(--stale); color: var(--stale); }
+  .btn-danger:hover { background: var(--stale); color: #fff; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* STAT BAR */
+  .stat-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .stat {
+    flex: 1;
+    padding: 18px 28px;
+    border-right: 1px solid var(--border);
+  }
+  .stat:last-child { border-right: none; }
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .stat-value.stale { color: var(--stale); }
+  .stat-value.good  { color: var(--good); }
+  .stat-value.warn  { color: var(--unknown); }
+  .stat-value.neutral { color: var(--text); }
+
+  /* TOOLBAR */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 28px;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+  }
+  .toolbar-left { display: flex; align-items: center; gap: 10px; }
+  .search-wrap { position: relative; }
+  .search-input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 12px 7px 32px;
+    border-radius: 2px;
+    width: 260px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .search-icon {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--dim);
+    font-size: 13px;
+  }
+  .filter-select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 7px 12px;
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  /* TABLE */
+  .table-wrap {
+    padding: 0 28px 28px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+  }
+  thead th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  tbody tr:hover { background: var(--surface); }
+  tbody td {
+    padding: 11px 12px;
+    font-size: 13px;
+    vertical-align: middle;
+  }
+  td.mono { font-family: var(--mono); font-size: 12px; }
+
+  /* STATUS BADGE */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .badge-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .badge.stale     { background: rgba(239,68,68,0.12);  color: var(--stale);   }
+  .badge.stale .badge-dot    { background: var(--stale); }
+  .badge.good      { background: rgba(34,197,94,0.10);  color: var(--good);    }
+  .badge.good .badge-dot     { background: var(--good); }
+  .badge.unknown   { background: rgba(245,158,11,0.12); color: var(--unknown); }
+  .badge.unknown .badge-dot  { background: var(--unknown); }
+  .badge.updating  { background: rgba(139,92,246,0.12); color: var(--updating);}
+  .badge.updating .badge-dot { background: var(--updating); animation: pulse 1s infinite; }
+  .badge.failed    { background: rgba(239,68,68,0.12);  color: var(--stale);   }
+  .badge.failed .badge-dot   { background: var(--stale); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  .device-name { font-weight: 600; color: #e2e8f0; max-width: 260px; }
+  .device-class { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .version-current { color: var(--text); }
+  .version-latest  { color: var(--good); font-size: 11px; margin-top: 2px; }
+  td .tip { color: var(--dim); font-size: 11px; margin-top: 2px; }
+
+  /* EMPTY / LOADING */
+  .empty-state {
+    text-align: center;
+    padding: 80px 0;
+    color: var(--dim);
+  }
+  .empty-state h3 {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    color: var(--text);
+  }
+
+  /* SCAN PROGRESS */
+  .scan-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(10,12,15,0.85);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .scan-overlay.active { display: flex; }
+  .scan-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 40px 60px;
+    text-align: center;
+  }
+  .scan-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 16px;
+  }
+  .scan-msg { color: var(--dim); font-size: 13px; }
+  .progress-bar-wrap {
+    margin-top: 24px;
+    width: 300px;
+    height: 2px;
+    background: var(--muted);
+    position: relative;
+    overflow: hidden;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    animation: sweep 1.8s ease-in-out infinite;
+    width: 40%;
+    border-radius: 1px;
+  }
+  @keyframes sweep {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(800%); }
+  }
+
+  /* TOAST */
+  .toast-wrap {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 300;
+  }
+  .toast {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 12px 18px;
+    border-radius: 2px;
+    border-left: 3px solid;
+    background: var(--surface);
+    border-color: var(--accent);
+    color: var(--text);
+    max-width: 380px;
+    animation: slideIn 0.2s ease;
+  }
+  .toast.success { border-color: var(--good); }
+  .toast.error   { border-color: var(--stale); }
+  @keyframes slideIn {
+    from { transform: translateX(100%); opacity: 0; }
+    to   { transform: translateX(0);   opacity: 1; }
+  }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="logo">DRVSCAN<span>/v1</span></div>
+    <div class="system-tag" id="systemTag">WINDOWS</div>
+    <div class="system-tag" id="lastScanTag">NOT SCANNED</div>
+  </div>
+  <div class="topbar-right">
+    <button class="btn" onclick="pnpScanAll()">PNPUTIL SCAN ALL</button>
+    <button class="btn btn-primary" id="scanBtn" onclick="triggerScan()">▶ RUN SCAN</button>
+  </div>
+</header>
+
+<!-- STATS -->
+<section class="stat-bar">
+  <div class="stat">
+    <div class="stat-label">Total Drivers</div>
+    <div class="stat-value neutral" id="statTotal">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Stale / Outdated</div>
+    <div class="stat-value stale" id="statStale">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Up to Date</div>
+    <div class="stat-value good" id="statGood">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Unknown</div>
+    <div class="stat-value warn" id="statUnknown">—</div>
+  </div>
+</section>
+
+<!-- TOOLBAR -->
+<div class="toolbar">
+  <div class="toolbar-left">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input class="search-input" id="searchInput" placeholder="Filter drivers..." oninput="renderTable()">
+    </div>
+    <select class="filter-select" id="statusFilter" onchange="renderTable()">
+      <option value="">ALL STATUS</option>
+      <option value="STALE">STALE</option>
+      <option value="UP_TO_DATE">UP TO DATE</option>
+      <option value="UNKNOWN">UNKNOWN</option>
+      <option value="UPDATE_FAILED">FAILED</option>
+    </select>
+    <select class="filter-select" id="classFilter" onchange="renderTable()">
+      <option value="">ALL CLASSES</option>
+    </select>
+  </div>
+  <div id="rowCount" style="font-family:var(--mono);font-size:11px;color:var(--dim);">—</div>
+</div>
+
+<!-- TABLE -->
+<div class="table-wrap">
+  <table id="driverTable">
+    <thead>
+      <tr>
+        <th>DEVICE</th>
+        <th>CLASS</th>
+        <th>CURRENT VERSION</th>
+        <th>DRIVER DATE</th>
+        <th>PROVIDER</th>
+        <th>STATUS</th>
+        <th>ACTION</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody">
+      <tr>
+        <td colspan="7">
+          <div class="empty-state">
+            <h3>No scan data</h3>
+            <p>Click <strong>RUN SCAN</strong> to enumerate installed drivers and check Windows Update.</p>
+          </div>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- SCAN OVERLAY -->
+<div class="scan-overlay" id="scanOverlay">
+  <div class="scan-box">
+    <div class="scan-title">SCANNING SYSTEM</div>
+    <div class="scan-msg" id="scanMsg">Querying WMI for installed drivers...</div>
+    <div class="progress-bar-wrap"><div class="progress-bar-fill"></div></div>
+  </div>
+</div>
+
+<!-- TOASTS -->
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+  let allDrivers = [];
+  const msgs = [
+    'Querying WMI for installed drivers...',
+    'Checking Windows Update catalog...',
+    'Comparing driver versions...',
+    'Analyzing staleness data...'
+  ];
+
+  // ── SCAN ──────────────────────────────────────────────────────────────────
+  async function triggerScan() {
+    showOverlay(true);
+    let i = 0;
+    const ticker = setInterval(() => {
+      document.getElementById('scanMsg').textContent = msgs[i++ % msgs.length];
+    }, 3000);
+
+    try {
+      const res = await fetch('/api/drivers/scan', { method: 'POST' });
+      if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+      const data = await res.json();
+      allDrivers = data.drivers || [];
+      updateStats(data.total, data.stale, data.upToDate, data.unknown);
+      populateClassFilter();
+      renderTable();
+      document.getElementById('lastScanTag').textContent = 'SCANNED ' + new Date().toLocaleTimeString();
+      toast('Scan complete — ' + data.total + ' drivers found.', 'success');
+    } catch (e) {
+      toast('Scan failed: ' + e.message, 'error');
+    } finally {
+      clearInterval(ticker);
+      showOverlay(false);
+    }
+  }
+
+  // ── UPDATE SINGLE DRIVER ──────────────────────────────────────────────────
+  async function updateDriver(deviceId) {
+    const btn = document.getElementById('btn-' + deviceId);
+    if (btn) { btn.disabled = true; btn.textContent = 'UPDATING...'; }
+
+    // Optimistically update status in store
+    const d = allDrivers.find(x => x.deviceId === deviceId);
+    if (d) { d.status = 'UPDATING'; renderTable(); }
+
+    try {
+      const res = await fetch('/api/drivers/' + encodeURIComponent(deviceId) + '/update', { method: 'POST' });
+      const result = await res.json();
+
+      if (d) {
+        d.status = result.success ? 'UP_TO_DATE' : 'UPDATE_FAILED';
+        d.statusMessage = result.message;
+        renderTable();
+      }
+      toast(result.message, result.success ? 'success' : 'error');
+    } catch (e) {
+      if (d) { d.status = 'UPDATE_FAILED'; d.statusMessage = e.message; renderTable(); }
+      toast('Update failed: ' + e.message, 'error');
+    }
+  }
+
+  // ── PNPUTIL SCAN ALL ──────────────────────────────────────────────────────
+  async function pnpScanAll() {
+    toast('Running pnputil /scan-devices...', '');
+    try {
+      const res = await fetch('/api/drivers/scan-all-devices', { method: 'POST' });
+      const result = await res.json();
+      toast(result.message, result.success ? 'success' : 'error');
+    } catch (e) {
+      toast('pnputil error: ' + e.message, 'error');
+    }
+  }
+
+  // ── RENDER ────────────────────────────────────────────────────────────────
+  function renderTable() {
+    const q      = document.getElementById('searchInput').value.toLowerCase();
+    const status = document.getElementById('statusFilter').value;
+    const cls    = document.getElementById('classFilter').value;
+
+    const filtered = allDrivers.filter(d => {
+      const matchQ = !q || (d.deviceName || '').toLowerCase().includes(q)
+                       || (d.provider || '').toLowerCase().includes(q)
+                       || (d.driverVersion || '').toLowerCase().includes(q);
+      const matchS = !status || d.status === status;
+      const matchC = !cls || d.deviceClass === cls;
+      return matchQ && matchS && matchC;
+    });
+
+    document.getElementById('rowCount').textContent = filtered.length + ' drivers';
+
+    const tbody = document.getElementById('tableBody');
+    if (!filtered.length) {
+      tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state">
+        <h3>No drivers match filter</h3><p>Adjust the search or filter criteria.</p>
+      </div></td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map(d => `
+      <tr>
+        <td>
+          <div class="device-name">${esc(d.deviceName || '—')}</div>
+        </td>
+        <td class="device-class">${esc(d.deviceClass || '—')}</td>
+        <td class="mono">
+          <div class="version-current">${esc(d.driverVersion || '—')}</div>
+          ${d.latestVersion ? `<div class="version-latest">▲ ${esc(d.latestVersion)}</div>` : ''}
+        </td>
+        <td class="mono">${formatDate(d.driverDate)}</td>
+        <td style="color:var(--dim);font-size:12px">${esc(d.provider || '—')}</td>
+        <td>${badge(d)}</td>
+        <td>${actionBtn(d)}</td>
+      </tr>
+    `).join('');
+  }
+
+  function badge(d) {
+    const map = {
+      STALE:         ['stale',   '● STALE'],
+      UP_TO_DATE:    ['good',    '● OK'],
+      UNKNOWN:       ['unknown', '● UNKNOWN'],
+      UPDATING:      ['updating','● UPDATING'],
+      UPDATE_FAILED: ['failed',  '● FAILED'],
+    };
+    const [cls, label] = map[d.status] || ['unknown', '● —'];
+    const tip = d.statusMessage ? ` title="${esc(d.statusMessage)}"` : '';
+    return `<span class="badge ${cls}"${tip}>${label}</span>`;
+  }
+
+  function actionBtn(d) {
+    if (d.status === 'STALE' || d.status === 'UPDATE_FAILED') {
+      return `<button class="btn btn-danger" id="btn-${d.deviceId}"
+        onclick="updateDriver('${esc(d.deviceId)}')">UPDATE</button>`;
+    }
+    if (d.status === 'UPDATING') {
+      return `<button class="btn" disabled id="btn-${d.deviceId}">UPDATING...</button>`;
+    }
+    return `<span style="color:var(--dim);font-family:var(--mono);font-size:11px">—</span>`;
+  }
+
+  function updateStats(total, stale, good, unknown) {
+    document.getElementById('statTotal').textContent   = total   ?? '—';
+    document.getElementById('statStale').textContent   = stale   ?? '—';
+    document.getElementById('statGood').textContent    = good    ?? '—';
+    document.getElementById('statUnknown').textContent = unknown ?? '—';
+  }
+
+  function populateClassFilter() {
+    const classes = [...new Set(allDrivers.map(d => d.deviceClass).filter(Boolean))].sort();
+    const sel = document.getElementById('classFilter');
+    sel.innerHTML = '<option value="">ALL CLASSES</option>' +
+      classes.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  }
+
+  function formatDate(raw) {
+    if (!raw || raw.length < 8) return '—';
+    try {
+      const y = raw.substring(0, 4);
+      const m = raw.substring(4, 6);
+      const day = raw.substring(6, 8);
+      return `${y}-${m}-${day}`;
+    } catch { return raw; }
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function showOverlay(on) {
+    document.getElementById('scanOverlay').classList.toggle('active', on);
+    document.getElementById('scanBtn').disabled = on;
+  }
+
+  function toast(msg, type) {
+    const wrap = document.getElementById('toastWrap');
+    const t = document.createElement('div');
+    t.className = 'toast ' + (type || '');
+    t.textContent = msg;
+    wrap.appendChild(t);
+    setTimeout(() => t.remove(), 5000);
+  }
+</script>
+</body>
+</html>
