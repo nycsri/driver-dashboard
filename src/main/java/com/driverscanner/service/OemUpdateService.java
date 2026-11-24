@@ -101,15 +101,17 @@ public class OemUpdateService {
 
     /** Returns null when the manufacturer could not be read. */
     private Oem queryOem() {
-        String manufacturer;
+        ProcessResult r;
         try {
-            manufacturer = runPowerShell("(Get-WmiObject Win32_ComputerSystem).Manufacturer");
+            r = run("powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                "try { (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).Manufacturer } catch { exit 1 }");
         } catch (Exception e) {
             log.warn("OEM detection failed; will retry on next scan", e);
             return null;
         }
-        if (manufacturer == null || manufacturer.isBlank()) {
-            log.warn("OEM detection returned no manufacturer; will retry on next scan");
+        String manufacturer = r.output == null ? "" : r.output.trim();
+        if (r.exitCode != 0 || manufacturer.isEmpty() || manufacturer.indexOf('\n') >= 0) {
+            log.warn("OEM detection unusable (exit {}, output '{}'); will retry on next scan", r.exitCode, manufacturer);
             return null;
         }
         String lower = manufacturer.toLowerCase();
@@ -307,7 +309,7 @@ public class OemUpdateService {
 
         ProcessResult result = run(tool,
             "/CM", "-search", "A", "-action", "INSTALL",
-            "-packagetypes", LENOVO_FIRMWARE_PACKAGE_TYPES, "-includerebootpackages", "3");
+            "-packagetypes", LENOVO_FIRMWARE_PACKAGE_TYPES, "-includerebootpackages", LENOVO_REBOOT_TYPES);
 
         boolean success = result.exitCode == 0 || result.exitCode == 3010;
         String msg = success
@@ -373,17 +375,22 @@ public class OemUpdateService {
     private void checkViaWindowsUpdateFirmware(List<Driver> drivers) throws Exception {
         ensurePSWindowsUpdate();
         String result = runPowerShell("""
-            Import-Module PSWindowsUpdate -ErrorAction Stop;
-            $all = Get-WindowsUpdate -Category 'Firmware' -ErrorAction SilentlyContinue;
-            foreach ($u in $all) { Write-Output ('%s' + $u.Title) }
-            Write-Output '%s'
+            try {
+                Import-Module PSWindowsUpdate -ErrorAction Stop;
+                $all = Get-WindowsUpdate -Category 'Firmware' -ErrorAction Stop;
+                foreach ($u in $all) { Write-Output ('%s' + $u.Title) }
+                Write-Output '%s'
+            } catch {
+                Write-Output ('QUERY_ERROR|' + ($_.Exception.Message -replace '\\s+',' '))
+            }
             """.formatted(WU_TITLE_PREFIX, WU_DONE_MARKER));
 
         List<String> lines = result.lines().map(String::trim).toList();
         if (!lines.contains(WU_DONE_MARKER)) {
             log.warn("PSWindowsUpdate firmware check inconclusive:\n{}", result);
             FirmwareCheck inconclusive = new FirmwareCheck(Driver.Status.UNKNOWN,
-                "Firmware check inconclusive: " + result.lines().findFirst().orElse("no output"));
+                "Windows Update firmware query failed: "
+                    + result.lines().findFirst().orElse("no output").replaceFirst("^QUERY_ERROR\\|", ""));
             for (Driver d : drivers) apply(d, inconclusive);
             return;
         }

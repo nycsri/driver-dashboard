@@ -3,6 +3,7 @@ package com.driverscanner.service;
 import com.driverscanner.model.Driver;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
@@ -16,7 +17,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.logging.Logger;
 
 /**
@@ -36,7 +36,12 @@ public class WindowsUpdateCatalogService {
 
     private static final Logger log = Logger.getLogger(WindowsUpdateCatalogService.class.getName());
     private final ObjectMapper mapper = new ObjectMapper();
+    private static final String QUERY_ERROR_MARKER = "QUERY_ERROR";
+    private static final String DONE_MARKER = "DONE";
     private final OemUpdateService oemUpdateService;
+
+    @Value("${driver.scan.ps-command-max-chars:24000}")
+    private int psCommandMaxChars = 24000;
 
     public WindowsUpdateCatalogService(OemUpdateService oemUpdateService) {
         this.oemUpdateService = oemUpdateService;
@@ -230,85 +235,156 @@ public class WindowsUpdateCatalogService {
     private void batchQueryPSWindowsUpdate(List<Driver> drivers) {
         try {
             oemUpdateService.ensurePSWindowsUpdate();
-
-            String namesArray = IntStream.range(0, drivers.size())
-                .mapToObj(i -> "'" + escapeForPowerShell(drivers.get(i).getDeviceName()) + "'")
-                .collect(Collectors.joining(","));
-
-            // Single PowerShell invocation: fetch all driver updates once, filter in-memory
-            String psCmd = String.format("""
-                $ErrorActionPreference = 'SilentlyContinue';
-                Import-Module PSWindowsUpdate;
-                $all = Get-WindowsUpdate -Category 'Drivers';
-                $names = @(%s);
-                for ($i = 0; $i -lt $names.Count; $i++) {
-                    $name = $names[$i];
-                    $pat = [Regex]::Escape($name);
-                    $m = $all | Where-Object { $_.Title -match $pat } | Select-Object -First 1;
-                    if ($m) {
-                        Write-Output ("$i|FOUND|" + $m.Title + "|" + ($m.KBArticleIDs -join ',') + "|" + $m.LastDeploymentChangeTime)
-                    } else {
-                        Write-Output "$i|NONE"
-                    }
-                }
-                """, namesArray);
-
-            ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            List<String> lines = new ArrayList<>();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!line.isBlank()) lines.add(line.trim());
-                }
-            }
-            process.waitFor();
-
-            String fullOutput = String.join("\n", lines);
-            boolean moduleError = fullOutput.contains("AuthorizationManager check failed")
-                || fullOutput.contains("CouldNotAutoloadMatchingModule")
-                || fullOutput.contains("module could not be loaded")
-                || fullOutput.contains("not recognized");
-
-            if (moduleError || lines.stream().noneMatch(l -> l.contains("|"))) {
-                log.warning("PSWindowsUpdate batch query unavailable — falling back to date check for all drivers");
-                drivers.forEach(this::checkByDriverDate);
-                return;
-            }
-
-            boolean[] matched = new boolean[drivers.size()];
-            for (String line : lines) {
-                String[] parts = line.split("\\|", 5);
-                if (parts.length < 2) continue;
-                try {
-                    int idx = Integer.parseInt(parts[0]);
-                    if (idx < 0 || idx >= drivers.size()) continue;
-                    matched[idx] = true;
-                    Driver d = drivers.get(idx);
-                    if ("FOUND".equals(parts[1])) {
-                        d.setStatus(Driver.Status.STALE);
-                        d.setLatestVersion(parts.length > 2 ? parts[2] : "Unknown");
-                        if (parts.length > 3 && !parts[3].isBlank())
-                            d.setUpdateKbId(parts[3].split(",")[0].trim());
-                        d.setStatusMessage("Update available: " + (parts.length > 2 ? parts[2] : line));
-                    } else {
-                        checkByDriverDate(d);
-                    }
-                } catch (NumberFormatException ignored) {}
-            }
-
-            // Any driver whose index didn't appear in output → date-based fallback
-            for (int i = 0; i < drivers.size(); i++) {
-                if (!matched[i]) checkByDriverDate(drivers.get(i));
-            }
-
         } catch (Exception e) {
-            log.warning("Batch PSWindowsUpdate query failed: " + e.getMessage() + " — falling back to date check");
-            drivers.forEach(this::checkByDriverDate);
+            log.warning("ensurePSWindowsUpdate failed: " + e.getMessage());
+        }
+        for (List<Driver> chunk : chunkByBudget(drivers, psCommandMaxChars)) {
+            try {
+                String namesArray = chunk.stream()
+                    .map(this::quotedName)
+                    .collect(Collectors.joining(","));
+                applyBatchOutput(chunk, runBatchScript(buildBatchScript(namesArray)));
+            } catch (Exception e) {
+                log.warning("Batch PSWindowsUpdate query failed: " + e.getMessage());
+                markQueryFailed(chunk, String.valueOf(e.getMessage()));
+            }
+        }
+    }
+
+    private String quotedName(Driver d) {
+        return "'" + escapeForPowerShell(d.getDeviceName()) + "'";
+    }
+
+    private static String buildBatchScript(String namesArray) {
+        return String.format("""
+            Import-Module PSWindowsUpdate;
+            try {
+                $all = Get-WindowsUpdate -Category 'Drivers' -ErrorAction Stop;
+            } catch {
+                Write-Output ('%s|' + ($_.Exception.Message -replace '\\s+',' '));
+                exit 1
+            }
+            $names = @(%s);
+            for ($i = 0; $i -lt $names.Count; $i++) {
+                $name = $names[$i];
+                $pat = [Regex]::Escape($name);
+                $m = $all | Where-Object { $_.Title -match $pat } | Select-Object -First 1;
+                if ($m) {
+                    Write-Output ("$i|FOUND|" + $m.Title + "|" + ($m.KBArticleIDs -join ',') + "|" + $m.LastDeploymentChangeTime)
+                } else {
+                    Write-Output "$i|NONE"
+                }
+            }
+            Write-Output '%s'
+            """, QUERY_ERROR_MARKER, namesArray, DONE_MARKER);
+    }
+
+    List<String> runBatchScript(String psCmd) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd
+        );
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.isBlank()) lines.add(line.trim());
+            }
+        }
+        process.waitFor();
+        return lines;
+    }
+
+    /** Splits so each chunk's joined names array stays within the budget; an oversized name gets its own chunk. */
+    List<List<Driver>> chunkByBudget(List<Driver> drivers, int budget) {
+        List<List<Driver>> chunks = new ArrayList<>();
+        List<Driver> current = new ArrayList<>();
+        int used = 0;
+        for (Driver d : drivers) {
+            int len = quotedName(d).length() + 1;
+            if (!current.isEmpty() && used + len > budget) {
+                chunks.add(current);
+                current = new ArrayList<>();
+                used = 0;
+            }
+            current.add(d);
+            used += len;
+        }
+        if (!current.isEmpty()) chunks.add(current);
+        return chunks;
+    }
+
+    void setPsCommandMaxChars(int psCommandMaxChars) {
+        this.psCommandMaxChars = psCommandMaxChars;
+    }
+
+    private void markQueryFailed(List<Driver> drivers, String reason) {
+        for (Driver d : drivers) {
+            d.setStatus(Driver.Status.UNKNOWN);
+            d.setStatusMessage("Windows Update query failed: " + reason);
+        }
+    }
+
+    /** Interprets one batch run's output; a failed query is UNKNOWN, never silently up to date. */
+    void applyBatchOutput(List<Driver> drivers, List<String> lines) {
+        String fullOutput = String.join("\n", lines);
+        boolean moduleError = fullOutput.contains("AuthorizationManager check failed")
+            || fullOutput.contains("CouldNotAutoloadMatchingModule")
+            || fullOutput.contains("module could not be loaded")
+            || fullOutput.contains("not recognized");
+
+        if (moduleError) {
+            String reason = lines.isEmpty() ? "unknown" : lines.get(0);
+            log.warning("PSWindowsUpdate module unavailable (" + reason + ") - using date-based estimate");
+            for (Driver d : drivers) {
+                checkByDriverDate(d);
+                if (d.getStatus() != Driver.Status.UNKNOWN)
+                    d.setStatusMessage("Windows Update unavailable - date-based estimate");
+            }
+            return;
+        }
+
+        String errPrefix = QUERY_ERROR_MARKER + "|";
+        String queryError = lines.stream().filter(l -> l.startsWith(errPrefix)).findFirst()
+            .map(l -> l.substring(errPrefix.length())).orElse(null);
+        if (queryError != null) {
+            log.warning("Windows Update query failed: " + queryError);
+            markQueryFailed(drivers, queryError);
+            return;
+        }
+        if (!lines.contains(DONE_MARKER)) {
+            String reason = lines.isEmpty() ? "no output" : "incomplete output: " + lines.get(0);
+            log.warning("Windows Update query did not complete: " + reason);
+            markQueryFailed(drivers, reason);
+            return;
+        }
+
+        boolean[] matched = new boolean[drivers.size()];
+        for (String line : lines) {
+            String[] parts = line.split("\\|", 5);
+            if (parts.length < 2) continue;
+            try {
+                int idx = Integer.parseInt(parts[0]);
+                if (idx < 0 || idx >= drivers.size()) continue;
+                matched[idx] = true;
+                Driver d = drivers.get(idx);
+                if ("FOUND".equals(parts[1])) {
+                    d.setStatus(Driver.Status.STALE);
+                    d.setLatestVersion(parts.length > 2 ? parts[2] : "Unknown");
+                    if (parts.length > 3 && !parts[3].isBlank())
+                        d.setUpdateKbId(parts[3].split(",")[0].trim());
+                    d.setStatusMessage("Update available: " + (parts.length > 2 ? parts[2] : line));
+                } else {
+                    checkByDriverDate(d);
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        for (int i = 0; i < drivers.size(); i++) {
+            if (!matched[i]) {
+                drivers.get(i).setStatus(Driver.Status.UNKNOWN);
+                drivers.get(i).setStatusMessage("Windows Update query failed: no result for device");
+            }
         }
     }
 }
