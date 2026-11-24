@@ -32,17 +32,26 @@ public class DriverBackupService {
 
     private final Path backupRoot;
     private final int recentDays;
+    private final BackupAclGuard aclGuard;
 
     @Autowired
     public DriverBackupService(
-            @Value("${driver.backup.root:${LOCALAPPDATA:}\\DriverDashboard\\Backups}") String backupRoot,
+            @Value("${driver.backup.root:}") String backupRoot,
             @Value("${driver.backup.recent-days:7}") int recentDays) {
-        this(resolveRoot(backupRoot), recentDays);
+        this(resolveRoot(backupRoot), recentDays, BackupAclGuard.windows());
     }
 
-    DriverBackupService(Path backupRoot, int recentDays) {
+    DriverBackupService(Path backupRoot, int recentDays, BackupAclGuard aclGuard) {
         this.backupRoot = backupRoot.toAbsolutePath().normalize();
         this.recentDays = recentDays;
+        this.aclGuard = aclGuard;
+    }
+
+    /** A backup folder that a non-admin process could have written to; its contents must not reach pnputil. */
+    public static class InsecureBackupException extends RuntimeException {
+        public InsecureBackupException(String message) {
+            super(message);
+        }
     }
 
     /** A blank LOCALAPPDATA leaves a drive-less path, which would silently resolve against the working dir. */
@@ -205,18 +214,9 @@ public class DriverBackupService {
             if ($d -and $d.InfName) { Write-Output $d.InfName } else { Write-Output 'NONE' }
             """, escapeForPowerShell(lookupId));
 
-        ProcessBuilder pb = new ProcessBuilder(
-            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd
-        );
-        pb.redirectErrorStream(true);
-        Process process = pb.start();
-
-        String result;
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            result = reader.lines().map(String::trim).filter(l -> !l.isEmpty()).findFirst().orElse("NONE");
-        }
-        process.waitFor();
-        return result;
+        ProcessResult result = runProcess(List.of(
+            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd));
+        return result.output().lines().map(String::trim).filter(l -> !l.isEmpty()).findFirst().orElse("NONE");
     }
 
     /** Walks without FOLLOW_LINKS and rejects any INF whose real location leaves the device folder. */

@@ -64,13 +64,21 @@ class BackupPromptTest {
         final List<List<String>> commands = new ArrayList<>();
 
         RecordingBackupService(Path root) {
-            super(root, 7);
+            this(root, BackupAclGuardTest.trusting());
+        }
+
+        RecordingBackupService(Path root, BackupAclGuard guard) {
+            super(root, 7, guard);
         }
 
         @Override
         ProcessResult runProcess(List<String> command) {
             commands.add(command);
-            return new ProcessResult(0, "");
+            return new ProcessResult(0, command.get(0).equals("powershell.exe") ? "oem42.inf" : "");
+        }
+
+        List<List<String>> commands(String exe) {
+            return commands.stream().filter(c -> c.get(0).equals(exe)).toList();
         }
     }
 
@@ -129,14 +137,81 @@ class BackupPromptTest {
         List<String> cmd = real.commands.get(0);
         assertEquals("pnputil.exe", cmd.get(0));
         assertEquals("/add-driver", cmd.get(1));
-        assertEquals(inf.toRealPath().toString(), cmd.get(2));
+        Path staged = Path.of(cmd.get(2));
+        // pnputil gets a private copy, so the validated original cannot be swapped underneath it
+        assertNotEquals(inf.toRealPath(), staged);
+        assertTrue(staged.startsWith(root.resolve("dev-1").toRealPath()));
+        assertTrue(staged.endsWith(Path.of("net.inf_amd64", "NET.INF")));
+        assertFalse(Files.exists(staged), "staged copy must be removed after install");
+        try (var left = Files.list(root.resolve("dev-1"))) {
+            assertEquals(1, left.count(), "only the original backup may remain");
+        }
+    }
+
+    @Test
+    void rollbackRefusesInsecureRootWithoutRunningPnputil(@TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Path inside = Files.createDirectories(root.resolve("dev-1").resolve("20240101_120000"));
+        Files.createFile(inside.resolve("oem42.inf"));
+        var usersWritable = new BackupAclGuard.Acl(BackupAclGuardTest.ADMINS, List.of(
+                BackupAclGuardTest.allow(BackupAclGuardTest.ADMINS, BackupAclGuardTest.FULL),
+                BackupAclGuardTest.allow(BackupAclGuardTest.USERS, java.util.EnumSet.of(java.nio.file.attribute.AclEntryPermission.WRITE_DATA))));
+        RecordingBackupService real = new RecordingBackupService(root,
+                BackupAclGuardTest.guard(java.util.Map.of(root.toRealPath(), usersWritable)));
+
+        assertThrows(DriverBackupService.InsecureBackupException.class, () -> real.rollbackDriver("dev-1", inside.toString()));
+        assertTrue(real.commands.isEmpty());
+        try (var left = Files.list(root.resolve("dev-1"))) {
+            assertEquals(1, left.count(), "no staging folder may be left behind");
+        }
+    }
+
+    @Test
+    void recentBackupInInsecureFolderIsNotReused(@TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Path device = Files.createDirectories(root.resolve("dev-1"));
+        Files.createDirectories(device.resolve(java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))));
+        var userOwned = new BackupAclGuard.Acl(BackupAclGuardTest.USERS, BackupAclGuardTest.ADMIN_ONLY.entries());
+
+        assertNotNull(new RecordingBackupService(root).findRecentBackup(driver()));
+        assertNull(new RecordingBackupService(root,
+                BackupAclGuardTest.guard(java.util.Map.of(device.toRealPath(), userOwned))).findRecentBackup(driver()));
+    }
+
+    @Test
+    void backupCreatesFoldersWithAdminOnlyAclBeforeExport(@TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("ProgramData").resolve("DriverDashboard").resolve("Backups");
+        Files.createDirectories(root.getParent().getParent());
+        RecordingBackupService real = new RecordingBackupService(root);
+
+        String backupPath = real.backupDriver(driver());
+
+        List<Path> secured = new ArrayList<>();
+        for (List<String> c : real.commands("icacls.exe")) {
+            if (c.contains("/inheritance:r")) {
+                assertEquals(List.of("/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"),
+                        c.subList(2, c.size()));
+                secured.add(Path.of(c.get(1)));
+            } else {
+                assertEquals(List.of("/setowner", "*S-1-5-32-544"), c.subList(2, c.size()));
+            }
+        }
+        assertEquals(List.of(root.getParent(), root, root.resolve("dev-1")), secured);
+        assertEquals(6, real.commands("icacls.exe").size());
+
+        int export = real.commands.indexOf(real.commands("pnputil.exe").get(0));
+        assertEquals("/export-driver", real.commands.get(export).get(1));
+        assertTrue(real.commands.subList(0, export).containsAll(real.commands("icacls.exe")),
+                "folders must be locked down before the package is exported into them");
+        assertTrue(Path.of(backupPath).startsWith(root.resolve("dev-1")));
     }
 
     @Test
     void rollbackAcceptsPathInsideOwnDeviceFolder(@TempDir Path tmp) throws Exception {
         Path root = tmp.resolve("Backups");
         Path inside = Files.createDirectories(root.resolve("dev-1").resolve("20240101_120000"));
-        DriverBackupService real = new DriverBackupService(root, 7);
+        DriverBackupService real = new DriverBackupService(root, 7, BackupAclGuardTest.trusting());
 
         assertEquals(inside.toRealPath(), real.resolveBackupPath("dev-1", inside.toString()));
     }
