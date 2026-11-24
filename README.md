@@ -123,8 +123,13 @@ Base path: `/api/drivers`. `{deviceId}` is the stable hash returned in the `devi
 
 - **There is no authentication or authorization.** The app is intended for local use on a single machine.
 - **Bind address:** `application.properties` does not set `server.address`, so the embedded server uses the Spring Boot default and listens on all network interfaces (port 8080), not only localhost. Anyone who can reach the port can trigger scans, driver and firmware updates, and rollbacks. Do not expose port 8080 to a network; use a host firewall rule or add `server.address=127.0.0.1` yourself. Run it only on trusted machines and networks.
-- **Administrator privileges:** the process must be elevated, so any request it accepts runs with Administrator rights, including PowerShell, `pnputil` and OEM tool invocations.
-- **Runtime module install:** before the first update, if the PSWindowsUpdate module is missing, the app runs `Install-Module PSWindowsUpdate -Scope CurrentUser` against the PowerShell Gallery, which may prompt to trust the repository or install the NuGet provider. PowerShell is launched with `-ExecutionPolicy Bypass`.
+- **No CSRF, Origin or Host checks:** state-changing endpoints (`POST /api/drivers/scan`, `/{id}/update`, scan-all) accept simple cross-origin requests, so a web page you visit, or a DNS-rebinding attack, could trigger them against a locally running instance. Run the app only while you are using it, and block port 8080 at the firewall.
+- **Administrator privileges:** the process must be elevated, so any request it accepts runs with Administrator rights, including PowerShell, `pnputil` and OEM tool invocations. On Dell systems a firmware update may suspend BitLocker and flash the BIOS.
+- **Runtime module install:** before the first update, if the PSWindowsUpdate module is missing, the app installs it from the PowerShell Gallery without pinning a version. Install and review the module yourself beforehand if that is a concern. PowerShell is launched with `-ExecutionPolicy Bypass`.
+- **Backup folder:** backups default to `%LOCALAPPDATA%\DriverDashboard\Backups`, which any process running as your user can write to. Rollback installs a package from there with Administrator rights. Point `driver.backup.root` at an Administrators-only folder.
+- **Executables by bare name:** `powershell.exe` and `pnputil.exe` are launched without absolute paths. Do not start the app from a user-writable working directory.
+- **No request limits:** scans and updates are not serialised and have no timeouts on update, backup and OEM calls. Error responses may include tool output and local paths.
+- **Dependencies:** Spring Boot 3.2.0 is past end of life. No known CVE was found to be reachable in this application, but an upgrade is recommended before relying on it.
 - Rollback is restricted to paths inside the device's own backup folder.
 
 ## Known limitations
