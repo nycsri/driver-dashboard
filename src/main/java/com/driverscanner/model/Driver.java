@@ -1,6 +1,9 @@
 package com.driverscanner.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
+
+import java.util.List;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class Driver {
@@ -20,7 +23,10 @@ public class Driver {
     private String latestVersion;    // from Windows Update catalog (if found)
     private String latestDate;
     private String updateKbId;       // KB article ID stored at scan time; used by update path
+    private String updateId;         // Windows Update Identity.UpdateID (GUID) of the matched update
     private String statusMessage;
+    @JsonIgnore private List<String> hardwareIds = List.of();   // upper-case, most specific first
+    @JsonIgnore private List<String> compatibleIds = List.of(); // upper-case
 
     // Constructors
     public Driver() {}
@@ -69,6 +75,15 @@ public class Driver {
 
     public String getUpdateKbId() { return updateKbId; }
     public void setUpdateKbId(String updateKbId) { this.updateKbId = updateKbId; }
+
+    public String getUpdateId() { return updateId; }
+    public void setUpdateId(String updateId) { this.updateId = updateId; }
+
+    public List<String> getHardwareIds() { return hardwareIds; }
+    public void setHardwareIds(List<String> ids) { this.hardwareIds = ids == null ? List.of() : List.copyOf(ids); }
+
+    public List<String> getCompatibleIds() { return compatibleIds; }
+    public void setCompatibleIds(List<String> ids) { this.compatibleIds = ids == null ? List.of() : List.copyOf(ids); }
 
     public String getStatusMessage() { return statusMessage; }
     public void setStatusMessage(String statusMessage) { this.statusMessage = statusMessage; }

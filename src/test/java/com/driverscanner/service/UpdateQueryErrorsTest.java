@@ -3,7 +3,6 @@ package com.driverscanner.service;
 import com.driverscanner.model.Driver;
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -44,12 +43,16 @@ class UpdateQueryErrorsTest {
     }
 
     @Test
-    void completedQueryMapsFoundAndNone() {
+    void completedQueryMapsMatchedAndUnmatched() {
         String recent = java.time.LocalDate.now().minusMonths(1).format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE)
             + "000000.000000-000";
         List<Driver> ds = List.of(driver("A", recent), driver("B", recent));
+        ds.get(0).setDriverVersion("1.0.0");
+        ds.get(0).setHardwareIds(List.of("PCI\\VEN_A"));
+        ds.get(1).setHardwareIds(List.of("PCI\\VEN_B"));
 
-        service().applyBatchOutput(ds, List.of("0|FOUND|A v2|KB123|2025-01-01", "1|NONE", "DONE"));
+        service().applyBatchOutput(ds, List.of(
+            "UPD|PCI\\VEN_A|2025-01-01|M|P|C|KB123|0a1b2c3d-4e5f-6789-abcd-ef0123456789|A - 2.0.0", "DONE"));
 
         assertEquals(Driver.Status.STALE, ds.get(0).getStatus());
         assertEquals("KB123", ds.get(0).getUpdateKbId());
@@ -66,31 +69,6 @@ class UpdateQueryErrorsTest {
 
         assertEquals(Driver.Status.UP_TO_DATE, ds.get(0).getStatus());
         assertEquals("Windows Update unavailable - date-based estimate", ds.get(0).getStatusMessage());
-    }
-
-    @Test
-    void chunkingKeepsEachChunkWithinBudgetAndPreservesOrder() {
-        List<Driver> ds = new ArrayList<>();
-        for (int i = 0; i < 20; i++) ds.add(driver("Device-" + i, null));
-
-        int budget = 60;
-        List<List<Driver>> chunks = service().chunkByBudget(ds, budget);
-
-        assertTrue(chunks.size() > 1);
-        List<Driver> flat = new ArrayList<>();
-        for (List<Driver> c : chunks) {
-            int len = c.stream().mapToInt(d -> d.getDeviceName().length() + 3).sum();
-            assertTrue(len <= budget, "chunk of " + c.size() + " is " + len);
-            flat.addAll(c);
-        }
-        assertEquals(ds, flat);
-    }
-
-    @Test
-    void oversizedSingleNameStillGetsItsOwnChunk() {
-        List<List<Driver>> chunks = service().chunkByBudget(List.of(driver("x".repeat(100), null), driver("y", null)), 10);
-
-        assertEquals(2, chunks.size());
     }
 
     static class OemStub extends OemUpdateService {

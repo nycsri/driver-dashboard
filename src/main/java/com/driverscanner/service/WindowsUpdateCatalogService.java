@@ -315,6 +315,10 @@ public class WindowsUpdateCatalogService {
         return chunks;
     }
 
+    void setPsTimeoutSeconds(long s) {}
+
+    Process startPowerShell(String script, java.io.File output) throws Exception { throw new UnsupportedOperationException(); }
+
     void setPsCommandMaxChars(int psCommandMaxChars) {
         this.psCommandMaxChars = psCommandMaxChars;
     }

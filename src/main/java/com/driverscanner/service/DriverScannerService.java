@@ -74,7 +74,7 @@ public class DriverScannerService {
      * Parses a CSV line from ConvertTo-Csv output.
      * Fields order: DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID
      */
-    private Driver parseCsvLine(String line) {
+    static Driver parseCsvLine(String line) {
         try {
             String[] parts = splitCsvLine(line);
             if (parts.length < 6) return null;
@@ -102,14 +102,14 @@ public class DriverScannerService {
         }
     }
 
-    private String clean(String s) {
+    private static String clean(String s) {
         return s.replaceAll("^\"|\"$", "").trim();
     }
 
     /**
      * Simple CSV splitter respecting quoted fields.
      */
-    private String[] splitCsvLine(String line) {
+    private static String[] splitCsvLine(String line) {
         List<String> result = new ArrayList<>();
         boolean inQuotes = false;
         StringBuilder current = new StringBuilder();
