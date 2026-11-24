@@ -11,7 +11,9 @@ import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 /**
  * Handles firmware staleness checks and updates via OEM-specific CLI tools.
@@ -20,11 +22,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Tool paths and exit-code semantics per OEM:
  *
  *   Dell  — Dell Command Update (dcu-cli.exe)
- *             scan exit 5 = updates available, 0/500 = none
+ *             scan exit 0 = updates found, 500 = none, 5 = reboot pending (verdict unknown)
  *             apply exit 0 = success, 1 = reboot needed (treated as success)
  *
  *   Lenovo — Lenovo Thin Installer (ThinInstaller.exe)
- *             exit 3010 = success + reboot needed, 0 = success, non-zero = fail
+ *             scan exit 10001 = updates found, 10000 = none
+ *             install exit 3010 = success + reboot needed, 0 = success, non-zero = fail
  *
  *   HP     — HP Image Assistant (HPImageAssistant.exe)
  *             scan exit 0 = no recommendations, 1 = updates available, other = error
@@ -50,6 +53,27 @@ public class OemUpdateService {
     private static final String HP_IMAGE_ASSISTANT_X86 =
         "C:\\Program Files (x86)\\HP\\HP Image Assistant\\HPImageAssistant.exe";
 
+    // Vendor CLI protocol values (not tunables): Dell Command | Update and Lenovo CDRT reference guides.
+    private static final int DCU_SCAN_UPDATES_FOUND = 0;
+    private static final int DCU_REBOOT_PENDING = 5;
+    private static final int DCU_SCAN_NO_UPDATES = 500;
+    private static final int LENOVO_SCAN_NO_UPDATES = 10000;
+    private static final int LENOVO_SCAN_UPDATES_FOUND = 10001;
+    private static final String LENOVO_FIRMWARE_PACKAGE_TYPES = "3,4"; // 3 = BIOS, 4 = Firmware
+    private static final String LENOVO_REBOOT_TYPES = "1,3,4,5";      // omitted => reboot type 0 only
+
+    // Whole-token counts: "10 packages" must never read as zero.
+    private static final Pattern LENOVO_PACKAGES_FOUND = Pattern.compile(
+        "(?<![\\d.,])\\b[1-9]\\d*\\s+(?:applicable\\s+)?(?:update\\s+)?packages?\\b",
+        Pattern.CASE_INSENSITIVE);
+    private static final Pattern LENOVO_NO_PACKAGES = Pattern.compile(
+        "(?<![\\d.,])\\b0\\s+(?:applicable\\s+)?(?:update\\s+)?packages?\\b"
+            + "|\\bno\\s+(?:applicable\\s+)?(?:updates?|packages?)\\b",
+        Pattern.CASE_INSENSITIVE);
+
+    private static final String WU_TITLE_PREFIX = "TITLE:";
+    private static final String WU_DONE_MARKER = "DONE";
+
     private volatile Oem cachedOem = null;
     private final Object oemLock = new Object();
     private final AtomicBoolean pswuEnsured = new AtomicBoolean(false);
@@ -61,31 +85,38 @@ public class OemUpdateService {
     // OEM detection
     // -------------------------------------------------------------------------
 
+    /** A failed or blank WMI lookup returns UNKNOWN without caching, so the next scan retries. */
     public Oem detectOem() {
         Oem oem = cachedOem;
         if (oem != null) return oem;
         synchronized (oemLock) {
-            if (cachedOem == null) {
-                cachedOem = queryOem();
-                log.info("Detected OEM: {}", cachedOem);
-            }
-            return cachedOem;
+            if (cachedOem != null) return cachedOem;
+            Oem queried = queryOem();
+            if (queried == null) return Oem.UNKNOWN;
+            cachedOem = queried;
+            log.info("Detected OEM: {}", queried);
+            return queried;
         }
     }
 
+    /** Returns null when the manufacturer could not be read. */
     private Oem queryOem() {
+        String manufacturer;
         try {
-            String manufacturer = runPowerShell(
-                "(Get-WmiObject Win32_ComputerSystem).Manufacturer"
-            ).toLowerCase();
-            if (manufacturer.contains("dell"))   return Oem.DELL;
-            if (manufacturer.contains("hp") || manufacturer.contains("hewlett")) return Oem.HP;
-            if (manufacturer.contains("lenovo")) return Oem.LENOVO;
-            return Oem.UNKNOWN;
+            manufacturer = runPowerShell("(Get-WmiObject Win32_ComputerSystem).Manufacturer");
         } catch (Exception e) {
-            log.warn("OEM detection failed", e);
-            return Oem.UNKNOWN;
+            log.warn("OEM detection failed; will retry on next scan", e);
+            return null;
         }
+        if (manufacturer == null || manufacturer.isBlank()) {
+            log.warn("OEM detection returned no manufacturer; will retry on next scan");
+            return null;
+        }
+        String lower = manufacturer.toLowerCase();
+        if (lower.contains("dell"))   return Oem.DELL;
+        if (lower.contains("hp") || lower.contains("hewlett")) return Oem.HP;
+        if (lower.contains("lenovo")) return Oem.LENOVO;
+        return Oem.UNKNOWN;
     }
 
     public boolean isOemToolAvailable() {
@@ -114,31 +145,23 @@ public class OemUpdateService {
 
     /**
      * OEM tools answer machine-wide, so the vendor CLI runs once and its verdict is applied to
-     * every firmware driver. Without a vendor tool, the Windows Update firmware fallback matches
-     * per device name and runs sequentially.
+     * every firmware driver. Without a vendor tool, one Windows Update firmware query runs and
+     * pending titles are matched to device names in memory.
      */
     public void checkFirmwareForUpdates(List<Driver> drivers) {
         if (drivers.isEmpty()) return;
-        FirmwareCheck check;
         try {
-            check = checkFirmwareOnce();
+            FirmwareCheck check = checkFirmwareOnce();
+            if (check != null) {
+                for (Driver d : drivers) apply(d, check);
+            } else {
+                checkViaWindowsUpdateFirmware(drivers);
+            }
         } catch (Exception e) {
             log.error("Firmware staleness check failed", e);
-            check = new FirmwareCheck(Driver.Status.UNKNOWN,
+            FirmwareCheck failed = new FirmwareCheck(Driver.Status.UNKNOWN,
                 "Firmware staleness check failed: " + e.getMessage());
-        }
-        if (check != null) {
-            for (Driver d : drivers) apply(d, check);
-            return;
-        }
-        for (Driver d : drivers) {
-            try {
-                apply(d, checkViaWindowsUpdateFirmware(d.getDeviceName()));
-            } catch (Exception e) {
-                log.error("Firmware staleness check failed for '{}'", d.getDeviceName(), e);
-                apply(d, new FirmwareCheck(Driver.Status.UNKNOWN,
-                    "Firmware staleness check failed: " + e.getMessage()));
-            }
+            for (Driver d : drivers) apply(d, failed);
         }
     }
 
@@ -186,15 +209,20 @@ public class OemUpdateService {
             return null;
         }
 
-        // DCU scan exit codes: 0=no updates, 5=updates available, 500=no applicable updates
+        // DCU reference guide: 500 = no updates found; 0 = success (a scan that found no updates
+        // reports 500, so 0 means updates were found); 5 = reboot pending from a prior operation.
         ProcessResult result = run(DELL_DCU,
             "/scan", "-updateType=bios,firmware", "-silent");
 
-        if (result.exitCode == 5) {
+        if (result.exitCode == DCU_SCAN_UPDATES_FOUND) {
             return new FirmwareCheck(Driver.Status.STALE, "Firmware update available (Dell Command Update).");
         }
-        if (result.exitCode == 0 || result.exitCode == 500) {
+        if (result.exitCode == DCU_SCAN_NO_UPDATES) {
             return new FirmwareCheck(Driver.Status.UP_TO_DATE, "Firmware is current (Dell Command Update).");
+        }
+        if (result.exitCode == DCU_REBOOT_PENDING) {
+            return new FirmwareCheck(Driver.Status.UNKNOWN,
+                "Dell Command Update cannot scan: a reboot from a previous update is pending.");
         }
         log.warn("Dell DCU scan unexpected exit {}:\n{}", result.exitCode, result.output);
         return new FirmwareCheck(Driver.Status.UNKNOWN, "Dell DCU scan exited with code " + result.exitCode);
@@ -227,40 +255,44 @@ public class OemUpdateService {
     // Lenovo Thin Installer / System Update
     // -------------------------------------------------------------------------
 
+    /**
+     * Thin Installer only: System Update's documented CLI (tvsu.exe -action LIST) shows an
+     * interactive pick list and has no documented return codes, so it cannot answer a silent check.
+     */
     private FirmwareCheck checkViaLenovo() throws Exception {
-        String tool = fileExists(LENOVO_THIN_INSTALLER)
-            ? LENOVO_THIN_INSTALLER : null;
-        if (tool == null && fileExists(LENOVO_SYSTEM_UPDATE))
-            tool = LENOVO_SYSTEM_UPDATE;
-
-        if (tool == null) {
-            log.info("Lenovo update tool not found — falling back to Windows Update firmware check");
+        if (!fileExists(LENOVO_THIN_INSTALLER)) {
+            log.info("Lenovo Thin Installer not found — falling back to Windows Update firmware check");
             return null;
         }
 
-        // Read-only: -action LIST reports applicable BIOS/firmware packages (packagetypes 1)
-        // without installing. Exit 0 = listing succeeded; packages present => output lists them.
-        ProcessResult result = run(tool,
-            "/CM", "-search", "A", "-action", "LIST",
-            "-packagetypes", "1", "-noreboot");
+        // -action SCAN only assesses applicability (read-only). Filters need Thin Installer 1.3.0041+.
+        ProcessResult result = run(LENOVO_THIN_INSTALLER,
+            "/CM", "-search", "A", "-action", "SCAN",
+            "-packagetypes", LENOVO_FIRMWARE_PACKAGE_TYPES,
+            "-includerebootpackages", LENOVO_REBOOT_TYPES, "-noicon");
 
+        if (result.exitCode == LENOVO_SCAN_UPDATES_FOUND) return lenovoStale();
+        if (result.exitCode == LENOVO_SCAN_NO_UPDATES)    return lenovoCurrent();
         if (result.exitCode != 0) {
-            log.warn("Lenovo update tool unexpected exit {}:\n{}", result.exitCode, result.output);
+            log.warn("Lenovo Thin Installer unexpected exit {}:\n{}", result.exitCode, result.output);
             return new FirmwareCheck(Driver.Status.UNKNOWN,
-                "Lenovo update tool exited with code " + result.exitCode);
+                "Lenovo Thin Installer exited with code " + result.exitCode);
         }
-        if (lenovoListReportsNoPackages(result.output)) {
-            return new FirmwareCheck(Driver.Status.UP_TO_DATE, "Firmware is current (Lenovo System Update).");
-        }
-        return new FirmwareCheck(Driver.Status.STALE, "Firmware update available (Lenovo System Update).");
+        // Exit 0 comes from builds that predate the documented SCAN codes: trust only explicit text.
+        String output = result.output == null ? "" : result.output;
+        if (LENOVO_PACKAGES_FOUND.matcher(output).find()) return lenovoStale();
+        if (LENOVO_NO_PACKAGES.matcher(output).find())    return lenovoCurrent();
+        log.warn("Lenovo Thin Installer output not recognised:\n{}", output);
+        return new FirmwareCheck(Driver.Status.UNKNOWN,
+            "Firmware status could not be determined from Lenovo Thin Installer output.");
     }
 
-    private static boolean lenovoListReportsNoPackages(String output) {
-        String lower = output == null ? "" : output.toLowerCase();
-        return lower.isBlank()
-            || lower.contains("no applicable")
-            || lower.contains("no update")
-            || lower.contains("0 package");
+    private static FirmwareCheck lenovoStale() {
+        return new FirmwareCheck(Driver.Status.STALE, "Firmware update available (Lenovo Thin Installer).");
+    }
+
+    private static FirmwareCheck lenovoCurrent() {
+        return new FirmwareCheck(Driver.Status.UP_TO_DATE, "Firmware is current (Lenovo Thin Installer).");
     }
 
     private UpdateResult updateViaLenovo(Driver driver) throws Exception {
@@ -275,7 +307,7 @@ public class OemUpdateService {
 
         ProcessResult result = run(tool,
             "/CM", "-search", "A", "-action", "INSTALL",
-            "-packagetypes", "1", "-includerebootpackages", "3");
+            "-packagetypes", LENOVO_FIRMWARE_PACKAGE_TYPES, "-includerebootpackages", "3");
 
         boolean success = result.exitCode == 0 || result.exitCode == 3010;
         String msg = success
@@ -337,26 +369,40 @@ public class OemUpdateService {
     // PSWindowsUpdate firmware category fallback (unknown OEMs)
     // -------------------------------------------------------------------------
 
-    private FirmwareCheck checkViaWindowsUpdateFirmware(String deviceName) throws Exception {
+    /** One catalog query per scan; titles are matched to device names in memory (case-insensitive substring). */
+    private void checkViaWindowsUpdateFirmware(List<Driver> drivers) throws Exception {
         ensurePSWindowsUpdate();
-        String psCmd = String.format("""
+        String result = runPowerShell("""
             Import-Module PSWindowsUpdate -ErrorAction Stop;
             $all = Get-WindowsUpdate -Category 'Firmware' -ErrorAction SilentlyContinue;
-            $pat = [Regex]::Escape('%s');
-            $u = $all | Where-Object { $_.Title -match $pat };
-            if ($u) { Write-Output 'STALE' } else { Write-Output 'CURRENT' }
-            """, escapeForPowerShell(deviceName));
+            foreach ($u in $all) { Write-Output ('%s' + $u.Title) }
+            Write-Output '%s'
+            """.formatted(WU_TITLE_PREFIX, WU_DONE_MARKER));
 
-        String result = runPowerShell(psCmd);
-        if (result.contains("STALE")) {
-            return new FirmwareCheck(Driver.Status.STALE, "Firmware update available via Windows Update.");
+        List<String> lines = result.lines().map(String::trim).toList();
+        if (!lines.contains(WU_DONE_MARKER)) {
+            log.warn("PSWindowsUpdate firmware check inconclusive:\n{}", result);
+            FirmwareCheck inconclusive = new FirmwareCheck(Driver.Status.UNKNOWN,
+                "Firmware check inconclusive: " + result.lines().findFirst().orElse("no output"));
+            for (Driver d : drivers) apply(d, inconclusive);
+            return;
         }
-        if (result.contains("CURRENT")) {
-            return new FirmwareCheck(Driver.Status.UP_TO_DATE, "Firmware is current (Windows Update firmware check).");
+        List<String> titles = lines.stream()
+            .filter(l -> l.startsWith(WU_TITLE_PREFIX))
+            .map(l -> l.substring(WU_TITLE_PREFIX.length()).toLowerCase(Locale.ROOT))
+            .toList();
+        for (Driver d : drivers) {
+            String name = d.getDeviceName();
+            if (name == null || name.isBlank()) {
+                apply(d, new FirmwareCheck(Driver.Status.UNKNOWN, "Firmware check skipped: device has no name."));
+                continue;
+            }
+            String needle = name.toLowerCase(Locale.ROOT);
+            boolean pending = titles.stream().anyMatch(t -> t.contains(needle));
+            apply(d, pending
+                ? new FirmwareCheck(Driver.Status.STALE, "Firmware update available via Windows Update.")
+                : new FirmwareCheck(Driver.Status.UP_TO_DATE, "Firmware is current (Windows Update firmware check)."));
         }
-        log.warn("PSWindowsUpdate firmware check inconclusive for '{}':\n{}", deviceName, result);
-        return new FirmwareCheck(Driver.Status.UNKNOWN,
-            "Firmware check inconclusive: " + result.lines().findFirst().orElse("no output"));
     }
 
     private UpdateResult updateViaWindowsUpdateFirmware(Driver driver) throws Exception {
