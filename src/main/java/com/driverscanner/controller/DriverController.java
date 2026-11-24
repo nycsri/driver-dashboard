@@ -6,6 +6,7 @@ import com.driverscanner.service.DriverBackupService;
 import com.driverscanner.service.DriverOrchestrationService;
 import com.driverscanner.service.DriverUpdateService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -184,6 +185,9 @@ public class DriverController {
             return ResponseEntity.ok(Map.of("success", true, "backupPath", backupPath));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (DriverBackupService.InsecureBackupException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of("error", "Backup folder is not protected; refusing to install from it: " + e.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Rollback failed: " + e.getMessage()));

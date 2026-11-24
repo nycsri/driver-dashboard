@@ -6,12 +6,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.logging.Logger;
@@ -21,7 +27,9 @@ import java.util.logging.Logger;
  * and restores it from backup for rollback.
  *
  * Backups are stored under driver.backup.root\<deviceId>\<timestamp>
- * (default %LOCALAPPDATA%\DriverDashboard\Backups).
+ * (default %ProgramData%\DriverDashboard\Backups). Because rollback installs from there
+ * with admin rights, every folder this service creates is locked to SYSTEM/Administrators,
+ * and the tree is re-verified (BackupAclGuard) before a backup is written, reused or installed.
  * Requires Administrator privileges for pnputil /export-driver and /add-driver.
  */
 @Service
@@ -29,6 +37,7 @@ public class DriverBackupService {
 
     private static final Logger log = Logger.getLogger(DriverBackupService.class.getName());
     private static final DateTimeFormatter TIMESTAMP_FMT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+    private static final String STAGING_PREFIX = ".rollback-";
 
     private final Path backupRoot;
     private final int recentDays;
@@ -54,10 +63,10 @@ public class DriverBackupService {
         }
     }
 
-    /** A blank LOCALAPPDATA leaves a drive-less path, which would silently resolve against the working dir. */
+    /** A blank ProgramData leaves a drive-less path, which would silently resolve against the working dir. */
     static Path resolveRoot(String configured) {
         if (configured == null || configured.isBlank() || configured.contains("${")) {
-            throw new IllegalStateException("driver.backup.root is not set (and LOCALAPPDATA is unavailable)");
+            throw new IllegalStateException("driver.backup.root is not set (and ProgramData is unavailable)");
         }
         Path root;
         try {
@@ -85,9 +94,13 @@ public class DriverBackupService {
             throw new Exception("Could not locate INF for device: " + driver.getDeviceName());
         }
 
+        Path deviceDir = deviceBackupDir(driver.getDeviceId());
+        createSecured(deviceDir);
+        Path realDeviceDir = deviceDir.toRealPath();
+        aclGuard.requireSecure(backupRoot.toRealPath(), realDeviceDir);
+
         String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
-        String backupPath = backupRoot.resolve(sanitizeId(driver.getDeviceId())).resolve(timestamp).toString();
-        Files.createDirectories(Path.of(backupPath));
+        String backupPath = Files.createDirectories(realDeviceDir.resolve(timestamp)).toString();
 
         ProcessResult result = runProcess(List.of("pnputil.exe", "/export-driver", infName, backupPath));
         if (result.exitCode() != 0) {
@@ -105,18 +118,83 @@ public class DriverBackupService {
      */
     public boolean rollbackDriver(String deviceId, String backupPath) throws Exception {
         Path backupDir = resolveBackupPath(deviceId, backupPath);
-        Path inf = findInfInBackup(backupDir, deviceBackupDir(deviceId).toRealPath());
-        if (inf == null) {
-            throw new Exception("No .inf file found in backup: " + backupPath);
-        }
+        Path realRoot = backupRoot.toRealPath();
+        Path realDeviceDir = deviceBackupDir(deviceId).toRealPath();
+        aclGuard.requireSecure(realRoot, realDeviceDir);
 
-        ProcessResult result = runProcess(List.of("pnputil.exe", "/add-driver", inf.toString(), "/install"));
-        if (result.exitCode() != 0) {
-            throw new Exception("pnputil /add-driver failed (exit " + result.exitCode() + "): " + result.output().trim());
+        // pnputil gets a private copy taken after the checks, so the validated package cannot be swapped underneath it
+        Path staging = Files.createTempDirectory(realDeviceDir, STAGING_PREFIX).toRealPath();
+        try {
+            copyTree(backupDir, staging);
+            aclGuard.requireSecure(realRoot, realDeviceDir, staging);
+            Path inf = findInfInBackup(staging, staging);
+            if (inf == null) {
+                throw new Exception("No .inf file found in backup: " + backupPath);
+            }
+
+            ProcessResult result = runProcess(List.of("pnputil.exe", "/add-driver", inf.toString(), "/install"));
+            if (result.exitCode() != 0) {
+                throw new Exception("pnputil /add-driver failed (exit " + result.exitCode() + "): " + result.output().trim());
+            }
+        } finally {
+            deleteTree(staging);
         }
 
         log.info("Driver rolled back from: " + backupPath);
         return true;
+    }
+
+    /**
+     * Creates any missing folders down to dir, locking each down before anything is placed in it.
+     * Folders that already exist (an older build's, or one planted by another process) are left
+     * untouched and only ever used if BackupAclGuard accepts them.
+     */
+    private void createSecured(Path dir) throws Exception {
+        if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) return;
+        Path parent = dir.getParent();
+        if (parent != null) createSecured(parent);
+        try {
+            Files.createDirectory(dir);
+        } catch (FileAlreadyExistsException raced) {
+            return;
+        }
+        String admins = "*" + BackupAclGuard.ADMINISTRATORS_SID;
+        for (List<String> args : List.of(
+                List.of("/inheritance:r", "/grant:r", "*" + BackupAclGuard.SYSTEM_SID + ":(OI)(CI)F", admins + ":(OI)(CI)F"),
+                List.of("/setowner", admins))) {
+            List<String> cmd = new ArrayList<>(List.of("icacls.exe", dir.toString()));
+            cmd.addAll(args);
+            ProcessResult r = runProcess(cmd);
+            if (r.exitCode() != 0) {
+                // left in place it would keep its inherited ACL and fail the guard on every later run
+                Files.deleteIfExists(dir);
+                throw new Exception("icacls could not secure " + dir + " (exit " + r.exitCode() + "): " + r.output().trim());
+            }
+        }
+    }
+
+    /** Copies without following links; any link or reparse point (e.g. a junction) aborts the rollback. */
+    private static void copyTree(Path src, Path dst) throws IOException {
+        Path realSrc = src.toRealPath();
+        try (var stream = Files.walk(realSrc)) {
+            for (Path p : (Iterable<Path>) stream::iterator) {
+                BasicFileAttributes a = Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (a.isSymbolicLink() || a.isOther()) {
+                    throw new IllegalArgumentException("Backup contains a link or reparse point: " + realSrc.relativize(p));
+                }
+                Path target = dst.resolve(realSrc.relativize(p).toString());
+                if (a.isDirectory()) Files.createDirectories(target);
+                else Files.copy(p, target, LinkOption.NOFOLLOW_LINKS);
+            }
+        }
+    }
+
+    private static void deleteTree(Path dir) {
+        try (var stream = Files.walk(dir)) {
+            for (Path p : stream.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(p);
+        } catch (IOException | UncheckedIOException e) {
+            log.warning("Could not remove rollback staging folder " + dir + ": " + e.getMessage());
+        }
     }
 
     /**
@@ -181,8 +259,10 @@ public class DriverBackupService {
      */
     public String findRecentBackup(Driver driver) {
         try {
-            Path deviceBackupDir = backupRoot.resolve(sanitizeId(driver.getDeviceId()));
-            if (!Files.exists(deviceBackupDir)) return null;
+            Path deviceDir = deviceBackupDir(driver.getDeviceId());
+            if (!Files.exists(deviceDir)) return null;
+            Path deviceBackupDir = deviceDir.toRealPath();
+            aclGuard.requireSecure(backupRoot.toRealPath(), deviceBackupDir);
 
             DateTimeFormatter fmt = TIMESTAMP_FMT;
             LocalDateTime cutoff = LocalDateTime.now().minusDays(recentDays);
@@ -197,7 +277,7 @@ public class DriverBackupService {
                             return false;
                         }
                     })
-                    .max(java.util.Comparator.comparing(Path::getFileName))
+                    .max(Comparator.comparing(Path::getFileName))
                     .map(Path::toString)
                     .orElse(null);
             }
