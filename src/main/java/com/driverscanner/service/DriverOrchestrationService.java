@@ -12,6 +12,7 @@ import java.util.Objects;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 
 @Service
 public class DriverOrchestrationService {
@@ -68,16 +69,24 @@ public class DriverOrchestrationService {
         return fresh;
     }
 
+    private static final Pattern REBOOT_REQUIRED = Pattern.compile(
+        "(?<!\\bno\\s)(?:\\b(?:reboot|restart)\\s+(?:is\\s+)?required\\b|\\bpending\\s+reboot\\b)",
+        Pattern.CASE_INSENSITIVE);
+
+    private static String trim(String s) {
+        return s == null ? null : s.trim();
+    }
+
     public record PostUpdateResolution(Driver.Status status, String message) {}
 
     public static PostUpdateResolution resolvePostUpdateStatus(String versionBefore, Driver rescanned,
                                                         String resultMessage) {
-        String after = rescanned.getDriverVersion();
-        if (!Objects.equals(versionBefore, after)) {
+        String after = trim(rescanned.getDriverVersion());
+        if (!Objects.equals(trim(versionBefore), after)) {
             return new PostUpdateResolution(rescanned.getStatus(),
                 "Updated: " + versionBefore + " -> " + after);
         }
-        if (resultMessage != null && resultMessage.toLowerCase().contains("reboot")) {
+        if (resultMessage != null && REBOOT_REQUIRED.matcher(resultMessage).find()) {
             return new PostUpdateResolution(Driver.Status.PENDING_REBOOT,
                 "Update installed — reboot required to apply.");
         }

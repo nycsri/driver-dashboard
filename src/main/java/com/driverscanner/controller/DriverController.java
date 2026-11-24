@@ -16,6 +16,9 @@ import java.util.Map;
 @RequestMapping("/api/drivers")
 public class DriverController {
 
+    private static final java.util.logging.Logger log =
+        java.util.logging.Logger.getLogger(DriverController.class.getName());
+
     @Autowired private DriverOrchestrationService orchestration;
     @Autowired private DriverUpdateService updateService;
     @Autowired private DriverBackupService backupService;
@@ -101,6 +104,7 @@ public class DriverController {
         try {
             rescanned = orchestration.rescanDriver(deviceId);
         } catch (Exception e) {
+            log.log(java.util.logging.Level.WARNING, "Post-update rescan failed for " + deviceId, e);
             rescanned = null;
         }
         if (rescanned == null) {

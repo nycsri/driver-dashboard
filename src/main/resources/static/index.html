@@ -477,9 +477,18 @@
       let msg = result.message;
       if (d) {
         if (result.success && !result.requiresConfirmation) {
-          const fresh = await (await fetch('/api/drivers')).json();
-          const f = fresh.find(x => x.deviceId === deviceId);
-          if (f) { Object.assign(d, f); msg = f.statusMessage || msg; }
+          let f = null;
+          try {
+            const fresh = await (await fetch('/api/drivers')).json();
+            f = fresh.find(x => x.deviceId === deviceId) || null;
+          } catch (_) { f = null; }
+          if (f) {
+            Object.assign(d, f); msg = f.statusMessage || msg;
+          } else {
+            msg = 'Update reported success; could not verify status.';
+            d.status = 'UNKNOWN';
+            d.statusMessage = msg;
+          }
         } else {
           d.status = 'UPDATE_FAILED';
           d.statusMessage = result.message;

@@ -36,4 +36,18 @@ class PostUpdateStatusTest {
         assertEquals(Driver.Status.UPDATE_FAILED, r.status());
         assertEquals("Update reported success but installed version unchanged", r.message());
     }
+
+    @Test
+    void noRebootRequiredMessageFails() {
+        var r = DriverOrchestrationService.resolvePostUpdateStatus(
+            "1.0", rescanned("1.0", Driver.Status.STALE), "No reboot required.");
+        assertEquals(Driver.Status.UPDATE_FAILED, r.status());
+    }
+
+    @Test
+    void versionChangedButStillStaleReportsStale() {
+        var r = DriverOrchestrationService.resolvePostUpdateStatus(
+            "1.0", rescanned("2.0", Driver.Status.STALE), "ok");
+        assertEquals(Driver.Status.STALE, r.status());
+    }
 }
