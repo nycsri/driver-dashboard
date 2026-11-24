@@ -1,8 +1,26 @@
 package com.driverscanner.security;
-import org.springframework.web.bind.annotation.*;
+
+import org.springframework.http.CacheControl;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
 import java.util.Map;
+
+/** Same-origin pages read the token here; the Host check in front of it blocks rebinding pages. */
 @RestController
 public class ApiTokenController {
-    public ApiTokenController(ApiTokenProvider tokens) {}
-    @GetMapping("/api/token") public Map<String, String> token() { return Map.of(); }
+
+    private final ApiTokenProvider tokens;
+
+    public ApiTokenController(ApiTokenProvider tokens) {
+        this.tokens = tokens;
+    }
+
+    @GetMapping("/api/token")
+    public ResponseEntity<Map<String, String>> token() {
+        return ResponseEntity.ok()
+            .cacheControl(CacheControl.noStore())
+            .body(Map.of("token", tokens.token()));
+    }
 }

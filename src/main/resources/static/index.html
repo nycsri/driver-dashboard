@@ -489,6 +489,27 @@
     'Analyzing staleness data...'
   ];
 
+  let apiToken = null;
+
+  async function getApiToken(refresh) {
+    if (!apiToken || refresh) {
+      const res = await fetch('/api/token', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Could not obtain API token (' + res.status + ')');
+      apiToken = (await res.json()).token;
+    }
+    return apiToken;
+  }
+
+  // State-changing requests must carry the per-start token; a 403 may mean the server restarted.
+  async function apiFetch(url, opts = {}) {
+    const send = async (refresh) => fetch(url, {
+      ...opts,
+      headers: { ...(opts.headers || {}), 'X-DD-Token': await getApiToken(refresh) },
+    });
+    const res = await send(false);
+    return res.status === 403 ? send(true) : res;
+  }
+
   // ── SCAN ──────────────────────────────────────────────────────────────────
   async function triggerScan() {
     showOverlay(true);
@@ -498,7 +519,7 @@
     }, 3000);
 
     try {
-      const res = await fetch('/api/drivers/scan', { method: 'POST' });
+      const res = await apiFetch('/api/drivers/scan', { method: 'POST' });
       if (!res.ok) throw new Error((await res.json()).error || res.statusText);
       const data = await res.json();
       allDrivers = data.drivers || [];
@@ -587,7 +608,7 @@
     if (d) { d.status = 'UPDATING'; renderTable(); }
 
     try {
-      const res = await fetch(driverUrl(deviceId) + '/update', {
+      const res = await apiFetch(driverUrl(deviceId) + '/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backup }),
@@ -661,7 +682,7 @@
     if (!ok) return;
 
     try {
-      const res = await fetch(driverUrl(deviceId) + '/rollback', {
+      const res = await apiFetch(driverUrl(deviceId) + '/rollback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backupPath }),
@@ -752,7 +773,7 @@
   async function pnpScanAll() {
     toast('Running pnputil /scan-devices...', '');
     try {
-      const res = await fetch('/api/drivers/scan-all-devices', { method: 'POST' });
+      const res = await apiFetch('/api/drivers/scan-all-devices', { method: 'POST' });
       const result = await res.json();
       toast(result.message, result.success ? 'success' : 'error');
     } catch (e) {
