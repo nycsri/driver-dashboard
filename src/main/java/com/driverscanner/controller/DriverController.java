@@ -79,15 +79,16 @@ public class DriverController {
 
         String versionBefore = driver.getDriverVersion();
         Driver.Status statusBefore = driver.getStatus();
+        String statusMessageBefore = driver.getStatusMessage();
         driver.setStatus(Driver.Status.UPDATING);
         orchestration.putDriver(deviceId, driver);
 
         UpdateResult result = updateService.triggerUpdate(driver, backup, forceWithoutBackup);
 
         if (result.isRequiresConfirmation()) {
-            // Keep the pre-update status so the Update action stays available if the user declines.
+            // Restore the pre-update state so the Update action stays available if the user declines.
             driver.setStatus(statusBefore);
-            driver.setStatusMessage("Backup failed — awaiting user confirmation.");
+            driver.setStatusMessage(statusMessageBefore);
             orchestration.putDriver(deviceId, driver);
             return ResponseEntity.status(409).body(result);
         }
@@ -161,7 +162,8 @@ public class DriverController {
     /**
      * POST /api/drivers/{deviceId}/rollback
      * Rolls back a driver to the backed-up version.
-     * Body: { "backupPath": "C:\\...\\DriverDashboard\\Backups\\...\\20240101_120000" }
+     * Body: { "backupPath": "C:\\...\\DriverDashboard\\Backups\\<deviceId>\\20240101_120000" }
+     * The path must lie inside this device's own backup folder, otherwise HTTP 400.
      */
     @PostMapping("/{deviceId}/rollback")
     public ResponseEntity<?> rollbackDriver(
@@ -172,7 +174,7 @@ public class DriverController {
             return ResponseEntity.badRequest().body(Map.of("error", "backupPath is required"));
         }
         try {
-            backupService.rollbackDriver(backupPath);
+            backupService.rollbackDriver(deviceId, backupPath);
             Driver driver = orchestration.getDriver(deviceId);
             if (driver != null) {
                 driver.setStatus(Driver.Status.UNKNOWN);

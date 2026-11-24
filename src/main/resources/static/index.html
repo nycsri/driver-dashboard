@@ -668,20 +668,23 @@
       });
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || res.statusText);
-      await refreshDriver(deviceId);
+      await refreshDriver(deviceId, { clearBackup: true });
       toast('Rolled back from ' + backupPath, 'success');
     } catch (e) {
       toast('Rollback failed: ' + e.message, 'error');
     }
   }
 
-  async function refreshDriver(deviceId) {
+  async function refreshDriver(deviceId, { clearBackup = false } = {}) {
+    const d = allDrivers.find(x => x.deviceId === deviceId);
+    // The backup was consumed by the rollback, so the ROLLBACK button must go even if the refetch fails.
+    if (d && clearBackup) delete d.lastBackupPath;
     try {
       const fresh = await (await fetch('/api/drivers')).json();
       const f = fresh.find(x => x.deviceId === deviceId);
-      const d = allDrivers.find(x => x.deviceId === deviceId);
-      if (d && f) { Object.assign(d, f); renderTable(); }
+      if (d && f) Object.assign(d, f);
     } catch (_) { /* row keeps its last known state */ }
+    if (d) renderTable();
   }
 
   // ── DIALOG ────────────────────────────────────────────────────────────────

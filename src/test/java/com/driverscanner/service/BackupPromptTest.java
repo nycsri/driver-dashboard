@@ -59,24 +59,91 @@ class BackupPromptTest {
         assertTrue(scripts.isEmpty(), "no install may run before the user confirms");
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"..\\..\\Windows", "C:\\Windows\\System32", "ROOT\\..\\..\\escape", "ROOT", "ROOTsibling\\x"})
-    void rollbackRejectsPathsOutsideBackupRoot(String raw, @TempDir Path tmp) throws Exception {
-        Path root = tmp.resolve("Backups");
-        Files.createDirectories(root);
-        Files.createDirectories(tmp.resolve("Backupssibling"));
-        DriverBackupService real = new DriverBackupService(root, 7);
-        String path = raw.replace("ROOT", root.toString());
+    /** Real path logic with the process seam stubbed, so no test can reach pnputil. */
+    private static final class RecordingBackupService extends DriverBackupService {
+        final List<List<String>> commands = new ArrayList<>();
 
-        assertThrows(IllegalArgumentException.class, () -> real.rollbackDriver(path));
+        RecordingBackupService(Path root) {
+            super(root, 7);
+        }
+
+        @Override
+        ProcessResult runProcess(List<String> command) {
+            commands.add(command);
+            return new ProcessResult(0, "");
+        }
+    }
+
+    // OUTSIDE is a temp folder holding an .inf, standing in for e.g. C:\Windows\System32 without touching it.
+    @ParameterizedTest
+    @ValueSource(strings = {"..\\..\\Windows", "OUTSIDE", "ROOT\\..\\..\\escape", "ROOT", "ROOTsibling\\x",
+            "ROOT\\dev-1", "ROOT\\dev-1\\..\\dev-2\\20240101_120000"})
+    void rollbackRejectsPathsOutsideDeviceFolder(String raw, @TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Files.createDirectories(root.resolve("dev-1"));
+        Files.createFile(Files.createDirectories(root.resolve("dev-2").resolve("20240101_120000")).resolve("x.inf"));
+        Files.createDirectories(tmp.resolve("Backupssibling"));
+        Path outside = Files.createDirectories(tmp.resolve("outside"));
+        Files.createFile(outside.resolve("evil.inf"));
+        RecordingBackupService real = new RecordingBackupService(root);
+        String path = raw.replace("OUTSIDE", outside.toString()).replace("ROOT", root.toString());
+
+        assertThrows(IllegalArgumentException.class, () -> real.rollbackDriver("dev-1", path));
+        assertTrue(real.commands.isEmpty());
     }
 
     @Test
-    void rollbackAcceptsPathInsideBackupRoot(@TempDir Path tmp) throws Exception {
+    void rollbackRejectsBackupInAnotherDevicesFolder(@TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Files.createDirectories(root.resolve("dev-1"));
+        Path other = Files.createDirectories(root.resolve("dev-2").resolve("20240101_120000"));
+        Files.createFile(other.resolve("oem42.inf"));
+        RecordingBackupService real = new RecordingBackupService(root);
+
+        assertThrows(IllegalArgumentException.class, () -> real.rollbackDriver("dev-1", other.toString()));
+        assertTrue(real.commands.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"..", ".", ""})
+    void rollbackRejectsDeviceIdThatEscapesBackupRoot(String deviceId, @TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Path inside = Files.createDirectories(root.resolve("dev-1").resolve("20240101_120000"));
+        Files.createFile(inside.resolve("oem42.inf"));
+        RecordingBackupService real = new RecordingBackupService(root);
+
+        assertThrows(IllegalArgumentException.class, () -> real.rollbackDriver(deviceId, inside.toString()));
+        assertTrue(real.commands.isEmpty());
+    }
+
+    @Test
+    void rollbackInOwnDeviceFolderInstallsUppercaseInf(@TempDir Path tmp) throws Exception {
+        Path root = tmp.resolve("Backups");
+        Path inside = Files.createDirectories(root.resolve("dev-1").resolve("20240101_120000"));
+        Path inf = Files.createFile(Files.createDirectories(inside.resolve("net.inf_amd64")).resolve("NET.INF"));
+        RecordingBackupService real = new RecordingBackupService(root);
+
+        assertTrue(real.rollbackDriver("dev-1", inside.toString()));
+
+        assertEquals(1, real.commands.size());
+        List<String> cmd = real.commands.get(0);
+        assertEquals("pnputil.exe", cmd.get(0));
+        assertEquals("/add-driver", cmd.get(1));
+        assertEquals(inf.toRealPath().toString(), cmd.get(2));
+    }
+
+    @Test
+    void rollbackAcceptsPathInsideOwnDeviceFolder(@TempDir Path tmp) throws Exception {
         Path root = tmp.resolve("Backups");
         Path inside = Files.createDirectories(root.resolve("dev-1").resolve("20240101_120000"));
         DriverBackupService real = new DriverBackupService(root, 7);
 
-        assertEquals(inside.toRealPath(), real.resolveBackupPath(inside.toString()));
+        assertEquals(inside.toRealPath(), real.resolveBackupPath("dev-1", inside.toString()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "   ", "\\DriverDashboard\\Backups", "relative\\Backups"})
+    void backupRootMustBeAbsolute(String configured) {
+        assertThrows(IllegalStateException.class, () -> DriverBackupService.resolveRoot(configured));
     }
 }
