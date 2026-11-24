@@ -1,213 +1,83 @@
 package com.driverscanner.service;
 
 import com.driverscanner.model.Driver;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
+import java.io.File;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Logger;
 
 /**
- * Checks Windows Update catalog for newer driver versions.
+ * Checks the Windows Update catalog for newer driver versions.
  *
- * Strategy:
- * 1. Query Microsoft's public Update Catalog search endpoint
- * 2. Parse results to find matching drivers
- * 3. Compare version strings / dates
- *
- * Note: The Windows Update Catalog does not have an official REST API.
- * We use the PowerShell PSWindowsUpdate module as the reliable fallback,
- * which is the production-grade approach used by enterprise tools.
+ * One PowerShell run asks the Windows Update Agent (Microsoft.Update.Session COM API) for every
+ * applicable, not-installed driver update; installed drivers are then matched to those updates by
+ * hardware ID in Java (see {@link CatalogMatcher}).
  */
 @Service
 public class WindowsUpdateCatalogService {
 
     private static final Logger log = Logger.getLogger(WindowsUpdateCatalogService.class.getName());
-    private final ObjectMapper mapper = new ObjectMapper();
     private static final String QUERY_ERROR_MARKER = "QUERY_ERROR";
+    private static final String WUA_UNAVAILABLE_MARKER = "WUA_UNAVAILABLE";
     private static final String DONE_MARKER = "DONE";
+    private static final String DATE_ESTIMATE_MESSAGE = "Windows Update unavailable - date-based estimate";
+
+    /**
+     * Emits one {@code UPD|hwid|date|model|provider|class|kb|updateId|title} line per driver update.
+     * Text fields are stripped of '|' and line breaks; Title goes last so the Java parser is exact
+     * even if that fails. No double quotes: they do not survive Windows command-line quoting.
+     */
+    private static final String CATALOG_SCRIPT = """
+        function S($v) { if ($null -eq $v) { '' } else { ([string]$v) -replace '[|\\r\\n\\t]', ' ' } }
+        try {
+            $session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop;
+            $searcher = $session.CreateUpdateSearcher();
+        } catch {
+            Write-Output ('%1$s|' + ($_.Exception.Message -replace '\\s+',' '));
+            exit 1
+        }
+        try {
+            $result = $searcher.Search('IsInstalled=0 and Type=''Driver''');
+            foreach ($u in $result.Updates) {
+                $d = '';
+                if ($u.DriverVerDate) { $d = ([datetime]$u.DriverVerDate).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+                $kb = (@($u.KBArticleIDs) | ForEach-Object { S $_ }) -join ',';
+                Write-Output ('UPD|' + (S $u.DriverHardwareID) + '|' + $d + '|' + (S $u.DriverModel) + '|' + (S $u.DriverProvider) + '|' + (S $u.DriverClass) + '|' + $kb + '|' + (S $u.Identity.UpdateID) + '|' + (S $u.Title))
+            }
+        } catch {
+            Write-Output ('%2$s|' + ($_.Exception.Message -replace '\\s+',' '));
+            exit 1
+        }
+        Write-Output '%3$s'
+        """.formatted(WUA_UNAVAILABLE_MARKER, QUERY_ERROR_MARKER, DONE_MARKER);
+
     private final OemUpdateService oemUpdateService;
 
-    @Value("${driver.scan.ps-command-max-chars:24000}")
-    private int psCommandMaxChars = 24000;
+    @Value("${driver.scan.ps-timeout-seconds:300}")
+    private long psTimeoutSeconds = 300;
 
     public WindowsUpdateCatalogService(OemUpdateService oemUpdateService) {
         this.oemUpdateService = oemUpdateService;
     }
 
-    /**
-     * Checks if a newer driver or firmware update is available.
-     * Firmware-class devices are delegated to OemUpdateService (Dell DCU / Lenovo SU / WU firmware).
-     * All other devices use PSWindowsUpdate driver category.
-     */
+    /** Single-driver variant of {@link #batchCheckForUpdates(List)}. */
     public void checkForUpdates(Driver driver) {
-        log.info("[BP1] checkForUpdates: name='" + driver.getDeviceName() + "' class='" + driver.getDeviceClass() + "' date='" + driver.getDriverDate() + "' version='" + driver.getDriverVersion() + "'");
-        if (isVirtualWindowsDriver(driver)) {
-            log.info("[BP1a] Skipping stale check for virtual Windows driver: " + driver.getDeviceName());
-            driver.setStatus(Driver.Status.UP_TO_DATE);
-            driver.setStatusMessage("Built-in Windows component - not applicable for updates.");
-            return;
-        }
-        if ("Firmware".equals(driver.getDeviceClass())) {
-            log.info("[BP2] Routing to OemUpdateService (Firmware class)");
-            oemUpdateService.checkFirmwareForUpdates(driver);
-            return;
-        }
-        try {
-            oemUpdateService.ensurePSWindowsUpdate();
-            String psCmd = String.format("""
-                Import-Module PSWindowsUpdate -ErrorAction Stop;
-                $all = Get-WindowsUpdate -Category 'Drivers' -ErrorAction SilentlyContinue;
-                $pat = [Regex]::Escape('%s');
-                $u = $all | Where-Object { $_.Title -match $pat } | Select-Object -First 1;
-                if ($u) {
-                    Write-Output ($u.Title + '|' + ($u.KBArticleIDs -join ',') + '|' + $u.LastDeploymentChangeTime)
-                } else {
-                    Write-Output 'NONE'
-                }
-                """, escapeForPowerShell(driver.getDeviceName()));
-
-            ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line);
-                }
-            }
-            process.waitFor();
-
-            String result = output.toString().trim();
-            log.info("[BP3] PSWindowsUpdate raw result: '" + result + "'");
-            boolean moduleLoadError = result.contains("AuthorizationManager check failed")
-                || result.contains("CouldNotAutoloadMatchingModule")
-                || result.contains("FormatXmlUpdateException")
-                || result.contains("module could not be loaded");
-            if (moduleLoadError || result.startsWith("ERROR") || result.contains("not recognized")) {
-                log.warning("[BP4a] PSWindowsUpdate module error — falling back to date check. Reason: " + result.lines().findFirst().orElse("unknown"));
-                checkByDriverDate(driver);
-            } else if (result.endsWith("NONE") || result.isEmpty()) {
-                log.info("[BP4b] PSWindowsUpdate returned NONE — falling back to date check");
-                checkByDriverDate(driver);
-            } else {
-                log.info("[BP4c] PSWindowsUpdate found update: " + result);
-                String[] parts = result.split("\\|", 3);
-                driver.setStatus(Driver.Status.STALE);
-                driver.setLatestVersion(parts.length > 0 ? parts[0] : "Unknown");
-                if (parts.length > 1 && !parts[1].isBlank())
-                    driver.setUpdateKbId(parts[1].split(",")[0].trim());
-                driver.setStatusMessage("Update available: " + result);
-            }
-
-        } catch (Exception e) {
-            log.warning("Windows Update catalog check failed for " + driver.getDeviceName() + ": " + e.getMessage());
-            // Fallback: mark unknown
-            checkByDriverDate(driver);
-        }
+        batchCheckForUpdates(new ArrayList<>(List.of(driver)));
     }
 
     /**
-     * Fallback: mark driver as stale if its date is older than 24 months.
-     * Used when PSWindowsUpdate is unavailable.
-     */
-    private void checkByDriverDate(Driver driver) {
-        String rawDate = driver.getDriverDate();
-        log.info("[BP5] checkByDriverDate: rawDate='" + rawDate + "'");
-        if (rawDate == null || rawDate.isBlank()) {
-            log.warning("[BP5a] Driver date is null/blank — setting UNKNOWN");
-            driver.setStatus(Driver.Status.UNKNOWN);
-            driver.setStatusMessage("Driver date unavailable.");
-            return;
-        }
-
-        LocalDate driverDate = parseDriverDate(rawDate);
-        log.info("[BP6] parseDriverDate result: " + driverDate);
-        if (driverDate == null) {
-            log.warning("[BP6a] Could not parse date '" + rawDate + "' — setting UNKNOWN");
-            driver.setStatus(Driver.Status.UNKNOWN);
-            driver.setStatusMessage("Could not parse driver date: " + rawDate);
-            return;
-        }
-
-        LocalDate cutoff = LocalDate.now().minusMonths(24);
-        log.info("[BP7] driverDate=" + driverDate + " cutoff=" + cutoff + " isBefore=" + driverDate.isBefore(cutoff));
-        if (driverDate.isBefore(cutoff)) {
-            log.info("[BP7a] → STALE");
-            driver.setStatus(Driver.Status.STALE);
-            driver.setStatusMessage("Driver date is over 24 months old.");
-        } else {
-            log.info("[BP7b] → UP_TO_DATE");
-            driver.setStatus(Driver.Status.UP_TO_DATE);
-            driver.setStatusMessage("Driver is recent (date-based check).");
-        }
-    }
-
-    private LocalDate parseDriverDate(String raw) {
-        // Raw WMI string: 20060621000000.000000-000
-        if (raw.length() >= 8 && raw.charAt(4) != '-' && raw.charAt(4) != '/') {
-            try {
-                LocalDate d = LocalDate.parse(raw.substring(0, 8), DateTimeFormatter.ofPattern("yyyyMMdd"));
-                log.info("[BP6-fmt] Parsed as WMI format (yyyyMMdd)");
-                return d;
-            } catch (Exception ignored) {}
-        }
-        // ISO format from PowerShell DateTime serialization: 2006-06-21 or 2006-06-21 00:00:00
-        if (raw.length() >= 10) {
-            try {
-                LocalDate d = LocalDate.parse(raw.substring(0, 10), DateTimeFormatter.ofPattern("yyyy-MM-dd"));
-                log.info("[BP6-fmt] Parsed as ISO format (yyyy-MM-dd)");
-                return d;
-            } catch (Exception ignored) {}
-        }
-        // US locale PowerShell format: 6/21/2006 12:00:00 AM
-        try {
-            String datePart = raw.trim().split("\\s+")[0];
-            LocalDate d = LocalDate.parse(datePart, DateTimeFormatter.ofPattern("M/d/yyyy"));
-            log.info("[BP6-fmt] Parsed as US locale format (M/d/yyyy)");
-            return d;
-        } catch (Exception ignored) {}
-        log.warning("[BP6-fmt] All date format attempts failed for: '" + raw + "'");
-        return null;
-    }
-
-    private boolean isVirtualWindowsDriver(Driver driver) {
-        String name = driver.getDeviceName();
-        if (name == null) return false;
-        String upper = name.toUpperCase();
-        return upper.startsWith("WAN MINIPORT")
-            || upper.startsWith("MICROSOFT KERNEL")
-            || upper.startsWith("NDIS")
-            || upper.startsWith("RAS");
-    }
-
-    private String escapeForPowerShell(String input) {
-        // Escape single quotes for PowerShell string safety
-        return input.replace("'", "''").replace("\"", "`\"");
-    }
-
-    /**
-     * Checks all drivers in a single PowerShell invocation instead of one process per driver.
      * Firmware drivers are routed to OemUpdateService; virtual Windows drivers are skipped.
-     * All remaining drivers are checked via a single Get-WindowsUpdate -Category 'Drivers' call
-     * whose results are filtered in-memory — eliminating N-1 extra PowerShell startups.
+     * All remaining drivers share one Windows Update Agent query.
      */
     public void batchCheckForUpdates(List<Driver> drivers) {
         List<Driver> firmware = new ArrayList<>();
@@ -228,99 +98,53 @@ public class WindowsUpdateCatalogService {
         oemUpdateService.checkFirmwareForUpdates(firmware);
 
         if (!toQuery.isEmpty()) {
-            batchQueryPSWindowsUpdate(toQuery);
+            queryWindowsUpdate(toQuery);
         }
     }
 
-    private void batchQueryPSWindowsUpdate(List<Driver> drivers) {
+    private void queryWindowsUpdate(List<Driver> drivers) {
         try {
-            oemUpdateService.ensurePSWindowsUpdate();
+            applyBatchOutput(drivers, runBatchScript(CATALOG_SCRIPT));
         } catch (Exception e) {
-            log.warning("ensurePSWindowsUpdate failed: " + e.getMessage());
-        }
-        for (List<Driver> chunk : chunkByBudget(drivers, psCommandMaxChars)) {
-            try {
-                String namesArray = chunk.stream()
-                    .map(this::quotedName)
-                    .collect(Collectors.joining(","));
-                applyBatchOutput(chunk, runBatchScript(buildBatchScript(namesArray)));
-            } catch (Exception e) {
-                log.warning("Batch PSWindowsUpdate query failed: " + e.getMessage());
-                markQueryFailed(chunk, String.valueOf(e.getMessage()));
-            }
+            log.warning("Windows Update driver query failed: " + e.getMessage());
+            markQueryFailed(drivers, String.valueOf(e.getMessage()));
         }
     }
 
-    private String quotedName(Driver d) {
-        return "'" + escapeForPowerShell(d.getDeviceName()) + "'";
-    }
-
-    private static String buildBatchScript(String namesArray) {
-        return String.format("""
-            Import-Module PSWindowsUpdate;
-            try {
-                $all = Get-WindowsUpdate -Category 'Drivers' -ErrorAction Stop;
-            } catch {
-                Write-Output ('%s|' + ($_.Exception.Message -replace '\\s+',' '));
-                exit 1
-            }
-            $names = @(%s);
-            for ($i = 0; $i -lt $names.Count; $i++) {
-                $name = $names[$i];
-                $pat = [Regex]::Escape($name);
-                $m = $all | Where-Object { $_.Title -match $pat } | Select-Object -First 1;
-                if ($m) {
-                    Write-Output ("$i|FOUND|" + $m.Title + "|" + ($m.KBArticleIDs -join ',') + "|" + $m.LastDeploymentChangeTime)
-                } else {
-                    Write-Output "$i|NONE"
-                }
-            }
-            Write-Output '%s'
-            """, QUERY_ERROR_MARKER, namesArray, DONE_MARKER);
-    }
-
+    /** Output goes to a file so a hung process cannot block the reader past the timeout. */
     List<String> runBatchScript(String psCmd) throws Exception {
+        Path out = Files.createTempFile("wu-driver-scan", ".txt");
+        try {
+            Process process = startPowerShell(psCmd, out.toFile());
+            if (!process.waitFor(psTimeoutSeconds, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new TimeoutException("timed out after " + psTimeoutSeconds + " s");
+            }
+            List<String> lines = new ArrayList<>();
+            new String(Files.readAllBytes(out), Charset.defaultCharset()).lines()
+                .filter(l -> !l.isBlank())
+                .forEach(l -> lines.add(l.trim()));
+            return lines;
+        } finally {
+            try {
+                Files.deleteIfExists(out);
+            } catch (Exception e) {
+                out.toFile().deleteOnExit();
+            }
+        }
+    }
+
+    Process startPowerShell(String script, File output) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
-            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd
+            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script
         );
         pb.redirectErrorStream(true);
-        Process process = pb.start();
-        List<String> lines = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (!line.isBlank()) lines.add(line.trim());
-            }
-        }
-        process.waitFor();
-        return lines;
+        pb.redirectOutput(output);
+        return pb.start();
     }
 
-    /** Splits so each chunk's joined names array stays within the budget; an oversized name gets its own chunk. */
-    List<List<Driver>> chunkByBudget(List<Driver> drivers, int budget) {
-        List<List<Driver>> chunks = new ArrayList<>();
-        List<Driver> current = new ArrayList<>();
-        int used = 0;
-        for (Driver d : drivers) {
-            int len = quotedName(d).length() + 1;
-            if (!current.isEmpty() && used + len > budget) {
-                chunks.add(current);
-                current = new ArrayList<>();
-                used = 0;
-            }
-            current.add(d);
-            used += len;
-        }
-        if (!current.isEmpty()) chunks.add(current);
-        return chunks;
-    }
-
-    void setPsTimeoutSeconds(long s) {}
-
-    Process startPowerShell(String script, java.io.File output) throws Exception { throw new UnsupportedOperationException(); }
-
-    void setPsCommandMaxChars(int psCommandMaxChars) {
-        this.psCommandMaxChars = psCommandMaxChars;
+    void setPsTimeoutSeconds(long psTimeoutSeconds) {
+        this.psTimeoutSeconds = psTimeoutSeconds;
     }
 
     private void markQueryFailed(List<Driver> drivers, String reason) {
@@ -330,21 +154,24 @@ public class WindowsUpdateCatalogService {
         }
     }
 
-    /** Interprets one batch run's output; a failed query is UNKNOWN, never silently up to date. */
+    /** Interprets one query run's output; a failed query is UNKNOWN, never silently up to date. */
     void applyBatchOutput(List<Driver> drivers, List<String> lines) {
-        String fullOutput = String.join("\n", lines);
-        boolean moduleError = fullOutput.contains("AuthorizationManager check failed")
+        // Update titles are data, not diagnostics: keep them out of the error-text checks.
+        String fullOutput = String.join("\n",
+            lines.stream().filter(l -> !l.startsWith(CatalogMatcher.UPDATE_PREFIX + "|")).toList());
+        boolean agentUnavailable = lines.stream().anyMatch(l -> l.startsWith(WUA_UNAVAILABLE_MARKER + "|"))
+            || fullOutput.contains("AuthorizationManager check failed")
             || fullOutput.contains("CouldNotAutoloadMatchingModule")
             || fullOutput.contains("module could not be loaded")
             || fullOutput.contains("not recognized");
 
-        if (moduleError) {
+        if (agentUnavailable) {
             String reason = lines.isEmpty() ? "unknown" : lines.get(0);
-            log.warning("PSWindowsUpdate module unavailable (" + reason + ") - using date-based estimate");
+            log.warning("Windows Update Agent unavailable (" + reason + ") - using date-based estimate");
             for (Driver d : drivers) {
                 checkByDriverDate(d);
                 if (d.getStatus() != Driver.Status.UNKNOWN)
-                    d.setStatusMessage("Windows Update unavailable - date-based estimate");
+                    d.setStatusMessage(DATE_ESTIMATE_MESSAGE);
             }
             return;
         }
@@ -364,31 +191,44 @@ public class WindowsUpdateCatalogService {
             return;
         }
 
-        boolean[] matched = new boolean[drivers.size()];
-        for (String line : lines) {
-            String[] parts = line.split("\\|", 5);
-            if (parts.length < 2) continue;
-            try {
-                int idx = Integer.parseInt(parts[0]);
-                if (idx < 0 || idx >= drivers.size()) continue;
-                matched[idx] = true;
-                Driver d = drivers.get(idx);
-                if ("FOUND".equals(parts[1])) {
-                    d.setStatus(Driver.Status.STALE);
-                    d.setLatestVersion(parts.length > 2 ? parts[2] : "Unknown");
-                    if (parts.length > 3 && !parts[3].isBlank())
-                        d.setUpdateKbId(parts[3].split(",")[0].trim());
-                    d.setStatusMessage("Update available: " + (parts.length > 2 ? parts[2] : line));
-                } else {
-                    checkByDriverDate(d);
-                }
-            } catch (NumberFormatException ignored) {}
+        Map<String, List<CatalogMatcher.CatalogUpdate>> catalog = CatalogMatcher.parse(lines);
+        log.info("Windows Update offers " + catalog.values().stream().mapToInt(List::size).sum()
+            + " driver update(s) for " + catalog.size() + " hardware ID(s)");
+        for (Driver d : drivers) {
+            CatalogMatcher.apply(d, CatalogMatcher.findBest(d, catalog));
         }
-        for (int i = 0; i < drivers.size(); i++) {
-            if (!matched[i]) {
-                drivers.get(i).setStatus(Driver.Status.UNKNOWN);
-                drivers.get(i).setStatusMessage("Windows Update query failed: no result for device");
-            }
+    }
+
+    /** Fallback only when the Windows Update Agent itself is unavailable: stale if older than 24 months. */
+    private void checkByDriverDate(Driver driver) {
+        String rawDate = driver.getDriverDate();
+        if (rawDate == null || rawDate.isBlank()) {
+            driver.setStatus(Driver.Status.UNKNOWN);
+            driver.setStatusMessage("Driver date unavailable.");
+            return;
         }
+        LocalDate driverDate = CatalogMatcher.parseDriverDate(rawDate);
+        if (driverDate == null) {
+            driver.setStatus(Driver.Status.UNKNOWN);
+            driver.setStatusMessage("Could not parse driver date: " + rawDate);
+            return;
+        }
+        if (driverDate.isBefore(LocalDate.now().minusMonths(24))) {
+            driver.setStatus(Driver.Status.STALE);
+            driver.setStatusMessage("Driver date is over 24 months old.");
+        } else {
+            driver.setStatus(Driver.Status.UP_TO_DATE);
+            driver.setStatusMessage("Driver is recent (date-based check).");
+        }
+    }
+
+    private boolean isVirtualWindowsDriver(Driver driver) {
+        String name = driver.getDeviceName();
+        if (name == null) return false;
+        String upper = name.toUpperCase();
+        return upper.startsWith("WAN MINIPORT")
+            || upper.startsWith("MICROSOFT KERNEL")
+            || upper.startsWith("NDIS")
+            || upper.startsWith("RAS");
     }
 }

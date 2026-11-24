@@ -506,6 +506,6 @@ public class OemUpdateService {
     }
 
     private String escapeForPowerShell(String input) {
-        return input.replace("'", "''").replace("\"", "`\"");
+        return WindowsUpdateLookup.escapeForPowerShell(input);
     }
 }

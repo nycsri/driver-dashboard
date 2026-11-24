@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -21,12 +22,18 @@ public class DriverScannerService {
 
     /**
      * PowerShell query to pull driver info from WMI.
-     * Fields: DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID
+     * Fields: DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID, HardWareID, CompatID.
+     * HardWareID/CompatID merge the signed-driver value with the device's full Win32_PnPEntity ID lists
+     * (string[]), ';'-joined so ConvertTo-Csv does not emit 'System.String[]'.
      */
     private static final String PS_QUERY = """
+        $ents = @{};
+        Get-CimInstance Win32_PnPEntity | ForEach-Object { if ($_.DeviceID) { $ents[$_.DeviceID] = $_ } };
         Get-CimInstance Win32_PnPSignedDriver |
         Where-Object { $_.DriverVersion -ne $null } |
-        Select-Object DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID |
+        Select-Object DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID,
+            @{n='HardWareID';e={ $e = if ($_.DeviceID) { $ents[$_.DeviceID] }; (@($_.HardWareID) + @(if ($e) { $e.HardwareID }) | Where-Object { $_ }) -join ';' }},
+            @{n='CompatID';e={ $e = if ($_.DeviceID) { $ents[$_.DeviceID] }; (@($_.CompatID) + @(if ($e) { $e.CompatibleID }) | Where-Object { $_ }) -join ';' }} |
         ConvertTo-Csv -NoTypeInformation
         """;
 
@@ -73,6 +80,7 @@ public class DriverScannerService {
     /**
      * Parses a CSV line from ConvertTo-Csv output.
      * Fields order: DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID
+     * [, HardWareID, CompatID] - the ID columns are optional so 6-column output still parses.
      */
     static Driver parseCsvLine(String line) {
         try {
@@ -94,12 +102,22 @@ public class DriverScannerService {
 
             Driver driver = new Driver(id, deviceName, version, driverDate, provider, deviceClass);
             driver.setRawDeviceId(deviceId);
+            driver.setHardwareIds(splitIds(parts.length > 6 ? clean(parts[6]) : ""));
+            driver.setCompatibleIds(splitIds(parts.length > 7 ? clean(parts[7]) : ""));
             return driver;
 
         } catch (Exception e) {
             log.warning("Failed to parse driver line: " + line + " | " + e.getMessage());
             return null;
         }
+    }
+
+    private static List<String> splitIds(String joined) {
+        return Arrays.stream(joined.split(";"))
+            .map(CatalogMatcher::normalizeId)
+            .filter(id -> !id.isEmpty())
+            .distinct()
+            .toList();
     }
 
     private static String clean(String s) {

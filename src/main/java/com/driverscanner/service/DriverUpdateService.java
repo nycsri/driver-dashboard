@@ -92,34 +92,8 @@ public class DriverUpdateService {
         }
 
         oemUpdateService.ensurePSWindowsUpdate();
-        String kbId = driver.getUpdateKbId();
-        // Pipe the matched update object directly into Install-WindowsUpdate to avoid
-        // -Title regex issues and -KBArticleID null problems for driver updates with no KB.
-        String psCmd = (kbId != null && !kbId.isBlank())
-            ? String.format("""
-                Import-Module PSWindowsUpdate -ErrorAction Stop;
-                $target = Get-WindowsUpdate -KBArticleID '%s' -ErrorAction SilentlyContinue | Select-Object -First 1;
-                if ($target) {
-                    $r = $target | Install-WindowsUpdate -AcceptAll -AutoReboot:$false -IgnoreReboot -ErrorAction SilentlyContinue;
-                    if ($r) { Write-Output ('SUCCESS: ' + ($r | Select-Object -ExpandProperty Title)) }
-                    else    { Write-Output 'NONE' }
-                } else {
-                    Write-Output 'NONE'
-                }
-                """, kbId)
-            : String.format("""
-                Import-Module PSWindowsUpdate -ErrorAction Stop;
-                $all = Get-WindowsUpdate -Category 'Drivers' -ErrorAction SilentlyContinue;
-                $pat = [Regex]::Escape('%s');
-                $target = $all | Where-Object { $_.Title -match $pat } | Select-Object -First 1;
-                if ($target) {
-                    $r = $target | Install-WindowsUpdate -AcceptAll -AutoReboot:$false -IgnoreReboot -ErrorAction SilentlyContinue;
-                    if ($r) { Write-Output ('SUCCESS: ' + ($r | Select-Object -ExpandProperty Title)) }
-                    else    { Write-Output 'NONE' }
-                } else {
-                    Write-Output 'NONE'
-                }
-                """, escapeForPowerShell(driver.getDeviceName()));
+        // Lookup order: UpdateID, then KB, then device-name title regex (see WindowsUpdateLookup).
+        String psCmd = WindowsUpdateLookup.buildInstallScript(driver);
 
         try {
             ProcessOutput ps = runPowerShell(psCmd);
