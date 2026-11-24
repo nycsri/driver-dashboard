@@ -6,7 +6,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 public class Driver {
 
     public enum Status {
-        UP_TO_DATE, STALE, UNKNOWN, UPDATING, UPDATE_FAILED
+        UP_TO_DATE, STALE, UNKNOWN, UPDATING, UPDATE_FAILED, PENDING_REBOOT
     }
 
     private String deviceId;         // stable hash of rawDeviceId, used as map key

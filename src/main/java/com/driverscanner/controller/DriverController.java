@@ -72,6 +72,7 @@ public class DriverController {
         boolean forceWithoutBackup = body != null
             && Boolean.TRUE.equals(body.get("forceWithoutBackup"));
 
+        String versionBefore = driver.getDriverVersion();
         driver.setStatus(Driver.Status.UPDATING);
         orchestration.putDriver(deviceId, driver);
 
@@ -85,8 +86,7 @@ public class DriverController {
         }
 
         if (result.isSuccess()) {
-            driver.setStatus(Driver.Status.UP_TO_DATE);
-            driver.setStatusMessage("Updated successfully.");
+            applyRescan(driver, deviceId, versionBefore, result);
         } else {
             driver.setStatus(Driver.Status.UPDATE_FAILED);
             driver.setStatusMessage(result.getMessage());
@@ -94,6 +94,28 @@ public class DriverController {
         orchestration.putDriver(deviceId, driver);
 
         return ResponseEntity.ok(result);
+    }
+
+    private void applyRescan(Driver driver, String deviceId, String versionBefore, UpdateResult result) {
+        Driver rescanned;
+        try {
+            rescanned = orchestration.rescanDriver(deviceId);
+        } catch (Exception e) {
+            rescanned = null;
+        }
+        if (rescanned == null) {
+            driver.setStatus(Driver.Status.UNKNOWN);
+            driver.setStatusMessage("Update reported success; could not verify by rescan.");
+            return;
+        }
+        var resolution = DriverOrchestrationService.resolvePostUpdateStatus(
+            versionBefore, rescanned, result.getMessage());
+        rescanned.setStatus(resolution.status());
+        rescanned.setStatusMessage(resolution.message());
+        orchestration.putDriver(deviceId, rescanned);
+        driver.setStatus(resolution.status());
+        driver.setStatusMessage(resolution.message());
+        driver.setDriverVersion(rescanned.getDriverVersion());
     }
 
     /**

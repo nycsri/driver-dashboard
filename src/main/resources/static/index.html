@@ -378,6 +378,7 @@
       <option value="UP_TO_DATE">UP TO DATE</option>
       <option value="UNKNOWN">UNKNOWN</option>
       <option value="UPDATE_FAILED">FAILED</option>
+      <option value="PENDING_REBOOT">REBOOT</option>
     </select>
     <select class="filter-select" id="classFilter" onchange="renderTable()">
       <option value="">ALL CLASSES</option>
@@ -473,12 +474,19 @@
       const res = await fetch('/api/drivers/' + encodeURIComponent(deviceId) + '/update', { method: 'POST' });
       const result = await res.json();
 
+      let msg = result.message;
       if (d) {
-        d.status = result.success ? 'UP_TO_DATE' : 'UPDATE_FAILED';
-        d.statusMessage = result.message;
+        if (result.success && !result.requiresConfirmation) {
+          const fresh = await (await fetch('/api/drivers')).json();
+          const f = fresh.find(x => x.deviceId === deviceId);
+          if (f) { Object.assign(d, f); msg = f.statusMessage || msg; }
+        } else {
+          d.status = 'UPDATE_FAILED';
+          d.statusMessage = result.message;
+        }
         renderTable();
       }
-      toast(result.message, result.success ? 'success' : 'error');
+      toast(msg, d && d.status !== 'UPDATE_FAILED' ? 'success' : 'error');
     } catch (e) {
       if (d) { d.status = 'UPDATE_FAILED'; d.statusMessage = e.message; renderTable(); }
       toast('Update failed: ' + e.message, 'error');
@@ -547,6 +555,7 @@
       UNKNOWN:       ['unknown', '● UNKNOWN'],
       UPDATING:      ['updating','● UPDATING'],
       UPDATE_FAILED: ['failed',  '● FAILED'],
+      PENDING_REBOOT: ['unknown', '● REBOOT'],
     };
     const [cls, label] = map[d.status] || ['unknown', '● —'];
     const tip = d.statusMessage ? ` title="${esc(d.statusMessage)}"` : '';

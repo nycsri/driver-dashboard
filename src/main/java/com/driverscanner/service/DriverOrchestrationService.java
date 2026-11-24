@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -52,5 +53,35 @@ public class DriverOrchestrationService {
 
     public void putDriver(String deviceId, Driver driver) {
         driverStore.put(deviceId, driver);
+    }
+
+    /** Rescans installed drivers and re-checks only the given device; null if it is no longer present. */
+    public Driver rescanDriver(String deviceId) throws Exception {
+        Driver fresh = scannerService.scanInstalledDrivers().stream()
+            .filter(d -> deviceId.equals(d.getDeviceId()))
+            .findFirst().orElse(null);
+        if (fresh == null) {
+            return null;
+        }
+        catalogService.batchCheckForUpdates(new ArrayList<>(List.of(fresh)));
+        driverStore.put(deviceId, fresh);
+        return fresh;
+    }
+
+    public record PostUpdateResolution(Driver.Status status, String message) {}
+
+    public static PostUpdateResolution resolvePostUpdateStatus(String versionBefore, Driver rescanned,
+                                                        String resultMessage) {
+        String after = rescanned.getDriverVersion();
+        if (!Objects.equals(versionBefore, after)) {
+            return new PostUpdateResolution(rescanned.getStatus(),
+                "Updated: " + versionBefore + " -> " + after);
+        }
+        if (resultMessage != null && resultMessage.toLowerCase().contains("reboot")) {
+            return new PostUpdateResolution(Driver.Status.PENDING_REBOOT,
+                "Update installed — reboot required to apply.");
+        }
+        return new PostUpdateResolution(Driver.Status.UPDATE_FAILED,
+            "Update reported success but installed version unchanged");
     }
 }
