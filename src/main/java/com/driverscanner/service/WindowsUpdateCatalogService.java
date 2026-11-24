@@ -219,15 +219,8 @@ public class WindowsUpdateCatalogService {
             }
         }
 
-        // Firmware: typically 1-3 drivers, handled per-OEM
-        firmware.parallelStream().forEach(d -> {
-            try {
-                oemUpdateService.checkFirmwareForUpdates(d);
-            } catch (Exception e) {
-                d.setStatus(Driver.Status.UNKNOWN);
-                d.setStatusMessage("Firmware check failed: " + e.getMessage());
-            }
-        });
+        // OEM tools give one machine-wide verdict: one vendor run for all firmware drivers
+        oemUpdateService.checkFirmwareForUpdates(firmware);
 
         if (!toQuery.isEmpty()) {
             batchQueryPSWindowsUpdate(toQuery);
