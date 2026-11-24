@@ -5,7 +5,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
@@ -31,17 +31,29 @@ public class WindowsUpdateCatalogService {
     private static final String WUA_UNAVAILABLE_MARKER = "WUA_UNAVAILABLE";
     private static final String DONE_MARKER = "DONE";
     private static final String DATE_ESTIMATE_MESSAGE = "Windows Update unavailable - date-based estimate";
+    private static final long KILL_WAIT_SECONDS = 5;
+    private static final String UTF8_BOM = "﻿";
 
     /**
-     * Emits one {@code UPD|hwid|date|model|provider|class|kb|updateId|title} line per driver update.
-     * Text fields are stripped of '|' and line breaks; Title goes last so the Java parser is exact
-     * even if that fails. No double quotes: they do not survive Windows command-line quoting.
+     * Emits one {@code UPD|hwid|date|model|provider|class|kb|updateId|version|title} line per hardware ID
+     * an update targets (one per WindowsDriverUpdateEntries entry; the update-level properties when it
+     * has none). version is blank unless WUA exposes a driver version. Text fields are stripped of '|'
+     * and line breaks; Title goes last so the Java parser is exact even if that fails.
+     * No double quotes: they do not survive Windows command-line quoting.
      */
     static final String CATALOG_SCRIPT = """
+        try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
         function S($v) { if ($null -eq $v) { '' } else { ([string]$v) -replace '[|\\r\\n\\t]', ' ' } }
+        function P($h, $dt, $m, $p, $c, $v) {
+            $d = '';
+            if ($dt) { $d = ([datetime]$dt).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+            Write-Output ('UPD|' + (S $h) + '|' + $d + '|' + (S $m) + '|' + (S $p) + '|' + (S $c) + '|' + $kb + '|' + $id + '|' + (S $v) + '|' + $t)
+        }
         try {
             $session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop;
             $searcher = $session.CreateUpdateSearcher();
+            <# 2 = ssWindowsUpdate: a WSUS-managed machine would otherwise ask WSUS, which rarely carries drivers #>
+            $searcher.ServerSelection = 2;
         } catch {
             Write-Output ('%1$s|' + ($_.Exception.Message -replace '\\s+',' '));
             exit 1
@@ -49,10 +61,16 @@ public class WindowsUpdateCatalogService {
         try {
             $result = $searcher.Search('IsInstalled=0 and Type=''Driver''');
             foreach ($u in $result.Updates) {
-                $d = '';
-                if ($u.DriverVerDate) { $d = ([datetime]$u.DriverVerDate).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
                 $kb = (@($u.KBArticleIDs) | ForEach-Object { S $_ }) -join ',';
-                Write-Output ('UPD|' + (S $u.DriverHardwareID) + '|' + $d + '|' + (S $u.DriverModel) + '|' + (S $u.DriverProvider) + '|' + (S $u.DriverClass) + '|' + $kb + '|' + (S $u.Identity.UpdateID) + '|' + (S $u.Title))
+                $id = S $u.Identity.UpdateID;
+                $t = S $u.Title;
+                $n = 0;
+                try {
+                    foreach ($e in $u.WindowsDriverUpdateEntries) {
+                        if ($e.HardwareID) { P $e.HardwareID $e.DriverVerDate $e.DriverModel $e.DriverProvider $e.DriverClass $e.DriverVerVersion; $n++ }
+                    }
+                } catch {}
+                if ($n -eq 0) { P $u.DriverHardwareID $u.DriverVerDate $u.DriverModel $u.DriverProvider $u.DriverClass $u.DriverVerVersion }
             }
         } catch {
             Write-Output ('%2$s|' + ($_.Exception.Message -replace '\\s+',' '));
@@ -118,10 +136,14 @@ public class WindowsUpdateCatalogService {
             Process process = startPowerShell(psCmd, out.toFile());
             if (!process.waitFor(psTimeoutSeconds, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
+                // Let the killed process release the output file before the finally block deletes it.
+                process.waitFor(KILL_WAIT_SECONDS, TimeUnit.SECONDS);
                 throw new TimeoutException("timed out after " + psTimeoutSeconds + " s");
             }
             List<String> lines = new ArrayList<>();
-            new String(Files.readAllBytes(out), Charset.defaultCharset()).lines()
+            String text = new String(Files.readAllBytes(out), StandardCharsets.UTF_8);
+            if (text.startsWith(UTF8_BOM)) text = text.substring(1);
+            text.lines()
                 .filter(l -> !l.isBlank())
                 .forEach(l -> lines.add(l.trim()));
             return lines;
@@ -156,6 +178,16 @@ public class WindowsUpdateCatalogService {
 
     /** Interprets one query run's output; a failed query is UNKNOWN, never silently up to date. */
     void applyBatchOutput(List<Driver> drivers, List<String> lines) {
+        // An explicit query failure wins over the text heuristics below: its message may contain them.
+        String errPrefix = QUERY_ERROR_MARKER + "|";
+        String queryError = lines.stream().filter(l -> l.startsWith(errPrefix)).findFirst()
+            .map(l -> l.substring(errPrefix.length())).orElse(null);
+        if (queryError != null) {
+            log.warning("Windows Update query failed: " + queryError);
+            markQueryFailed(drivers, queryError);
+            return;
+        }
+
         // Update titles are data, not diagnostics: keep them out of the error-text checks.
         String fullOutput = String.join("\n",
             lines.stream().filter(l -> !l.startsWith(CatalogMatcher.UPDATE_PREFIX + "|")).toList());
@@ -176,14 +208,6 @@ public class WindowsUpdateCatalogService {
             return;
         }
 
-        String errPrefix = QUERY_ERROR_MARKER + "|";
-        String queryError = lines.stream().filter(l -> l.startsWith(errPrefix)).findFirst()
-            .map(l -> l.substring(errPrefix.length())).orElse(null);
-        if (queryError != null) {
-            log.warning("Windows Update query failed: " + queryError);
-            markQueryFailed(drivers, queryError);
-            return;
-        }
         if (!lines.contains(DONE_MARKER)) {
             String reason = lines.isEmpty() ? "no output" : "incomplete output: " + lines.get(0);
             log.warning("Windows Update query did not complete: " + reason);

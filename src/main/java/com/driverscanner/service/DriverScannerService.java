@@ -23,6 +23,8 @@ public class DriverScannerService {
     /**
      * PowerShell query to pull driver info from WMI.
      * Fields: DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID, HardWareID, CompatID.
+     * DriverDate is the UTC calendar date as yyyy-MM-dd: WMI stores midnight UTC, so a local-time or
+     * culture-formatted rendering can shift the day or be unparseable.
      * HardWareID/CompatID merge the signed-driver value with the device's full Win32_PnPEntity ID lists
      * (string[]), ';'-joined so ConvertTo-Csv does not emit 'System.String[]'.
      */
@@ -31,7 +33,9 @@ public class DriverScannerService {
         Get-CimInstance Win32_PnPEntity | ForEach-Object { if ($_.DeviceID) { $ents[$_.DeviceID] = $_ } };
         Get-CimInstance Win32_PnPSignedDriver |
         Where-Object { $_.DriverVersion -ne $null } |
-        Select-Object DeviceName, DriverVersion, DriverDate, Manufacturer, DeviceClass, DeviceID,
+        Select-Object DeviceName, DriverVersion,
+            @{n='DriverDate';e={ if ($_.DriverDate) { $_.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) } else { '' } }},
+            Manufacturer, DeviceClass, DeviceID,
             @{n='HardWareID';e={ $e = if ($_.DeviceID) { $ents[$_.DeviceID] }; (@($_.HardWareID) + @(if ($e) { $e.HardwareID }) | Where-Object { $_ }) -join ';' }},
             @{n='CompatID';e={ $e = if ($_.DeviceID) { $ents[$_.DeviceID] }; (@($_.CompatID) + @(if ($e) { $e.CompatibleID }) | Where-Object { $_ }) -join ';' }} |
         ConvertTo-Csv -NoTypeInformation
