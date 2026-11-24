@@ -33,6 +33,18 @@ class UpdateQueryErrorsTest {
     }
 
     @Test
+    void queryErrorMentioningNotRecognizedIsUnknownNotDateFallback() {
+        String recent = java.time.LocalDate.now().minusMonths(1).format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE)
+            + "000000.000000-000";
+        List<Driver> ds = List.of(driver("A", recent));
+
+        service().applyBatchOutput(ds, List.of("QUERY_ERROR|Exception from HRESULT: criteria not recognized"));
+
+        assertEquals(Driver.Status.UNKNOWN, ds.get(0).getStatus());
+        assertTrue(ds.get(0).getStatusMessage().startsWith("Windows Update query failed"), ds.get(0).getStatusMessage());
+    }
+
+    @Test
     void missingDoneMarkerIsUnknown() {
         List<Driver> ds = List.of(driver("A", "20240101000000.000000-000"));
 
@@ -52,7 +64,7 @@ class UpdateQueryErrorsTest {
         ds.get(1).setHardwareIds(List.of("PCI\\VEN_B"));
 
         service().applyBatchOutput(ds, List.of(
-            "UPD|PCI\\VEN_A|2025-01-01|M|P|C|KB123|0a1b2c3d-4e5f-6789-abcd-ef0123456789|A - 2.0.0", "DONE"));
+            "UPD|PCI\\VEN_A|2025-01-01|M|P|C|KB123|0a1b2c3d-4e5f-6789-abcd-ef0123456789||A - 2.0.0", "DONE"));
 
         assertEquals(Driver.Status.STALE, ds.get(0).getStatus());
         assertEquals("KB123", ds.get(0).getUpdateKbId());

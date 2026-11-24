@@ -26,7 +26,7 @@ public class DriverScannerService {
      * HardWareID/CompatID merge the signed-driver value with the device's full Win32_PnPEntity ID lists
      * (string[]), ';'-joined so ConvertTo-Csv does not emit 'System.String[]'.
      */
-    private static final String PS_QUERY = """
+    static final String PS_QUERY = """
         $ents = @{};
         Get-CimInstance Win32_PnPEntity | ForEach-Object { if ($_.DeviceID) { $ents[$_.DeviceID] = $_ } };
         Get-CimInstance Win32_PnPSignedDriver |

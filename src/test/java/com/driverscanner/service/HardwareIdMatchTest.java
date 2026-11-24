@@ -28,7 +28,12 @@ class HardwareIdMatchTest {
     }
 
     private static String upd(String hwid, String date, String kb, String id, String title) {
-        return "UPD|" + hwid + "|" + date + "|Model|Intel|Net|" + kb + "|" + id + "|" + title;
+        return upd(hwid, date, "Net", kb, id, "", title);
+    }
+
+    /** UPD|hwid|date|model|provider|class|kb|updateId|version|title */
+    private static String upd(String hwid, String date, String cls, String kb, String id, String version, String title) {
+        return "UPD|" + hwid + "|" + date + "|Model|Intel|" + cls + "|" + kb + "|" + id + "|" + version + "|" + title;
     }
 
     private static WindowsUpdateCatalogService service() {
@@ -151,14 +156,128 @@ class HardwareIdMatchTest {
     }
 
     @Test
-    void compatibleIdIsLowerConfidenceFallback() {
+    void compatibleIdOnlyMatchIsUnknownAndNotInstallable() {
         Driver d = driver("Dev", "1.0.0", "2020-01-01", HWID);
-        d.setCompatibleIds(List.of("PCI\\CC_0280"));
+        d.setCompatibleIds(List.of("PCI\\VEN_8086&DEV_A0F0&CC_0280"));
 
-        service().applyBatchOutput(List.of(d), List.of(upd("pci\\cc_0280", "2024-06-01", "", GUID, "Generic - 2.0.0"), "DONE"));
+        service().applyBatchOutput(List.of(d), List.of(
+            upd("pci\\ven_8086&dev_a0f0&cc_0280", "2024-06-01", "5005565", GUID, "Generic - 2.0.0"), "DONE"));
+
+        assertEquals(Driver.Status.UNKNOWN, d.getStatus());
+        assertTrue(d.getStatusMessage().contains("matched by compatible ID only - cannot confirm"), d.getStatusMessage());
+        assertNull(d.getUpdateId());
+        assertNull(d.getUpdateKbId());
+    }
+
+    @Test
+    void classCodeIdsAreIgnoredForMatching() {
+        Driver d = driver("Dev", "1.0.0", "2020-01-01", HWID, "PCI\\CC_0280");
+        d.setCompatibleIds(List.of("USB\\Class_E0&SubClass_01", "PCI\\CC_0280"));
+
+        service().applyBatchOutput(List.of(d), List.of(
+            upd("PCI\\CC_0280", "2024-06-01", "", GUID, "Generic - 2.0.0"),
+            upd("USB\\CLASS_E0&SUBCLASS_01", "2024-06-01", "", GUID, "Generic - 2.0.0"),
+            "DONE"));
+
+        assertEquals(Driver.Status.UP_TO_DATE, d.getStatus());
+        assertEquals("No newer driver in Windows Update catalog", d.getStatusMessage());
+    }
+
+    @Test
+    void anyNewerCandidateIsStaleAndNewestQualifyingIsPicked() {
+        Driver d = driver("Dev", "22.100.0.0", "2023-01-01", HWID);
+        String id1 = "11111111-1111-1111-1111-111111111111";
+        String id3 = "33333333-3333-3333-3333-333333333333";
+
+        service().applyBatchOutput(List.of(d), List.of(
+            upd(HWID, "2025-06-01", "", id1, "Intel - Net - 22.050.0.0"),
+            upd(HWID, "2024-01-01", "5005565", GUID, "Intel - Net - 22.110.1.1"),
+            upd(HWID, "2023-06-01", "", id3, "Intel - Net - 22.105.0.0"),
+            "DONE"));
 
         assertEquals(Driver.Status.STALE, d.getStatus());
-        assertTrue(d.getStatusMessage().contains("compatible ID"), d.getStatusMessage());
+        assertEquals("22.110.1.1", d.getLatestVersion());
+        assertEquals("5005565", d.getUpdateKbId());
+        assertEquals(GUID, d.getUpdateId());
+    }
+
+    @Test
+    void extensionAndSoftwareComponentSkippedUnlessDeviceClassMatches() {
+        Driver net = driver("Net", "1.0.0", "2020-01-01", HWID);
+        net.setDeviceClass("Net");
+        Driver ext = driver("Ext", "1.0.0", "2020-01-01", HWID);
+        ext.setDeviceClass("Extension");
+
+        service().applyBatchOutput(List.of(net, ext), List.of(
+            upd(HWID, "2024-06-01", "Extension", "", GUID, "", "Vendor - Extension - 2.0.0"),
+            upd(HWID, "2024-06-01", "SoftwareComponent", "", GUID, "", "Vendor - SoftwareComponent - 3.0.0"),
+            "DONE"));
+
+        assertEquals(Driver.Status.UP_TO_DATE, net.getStatus());
+        assertEquals("No newer driver in Windows Update catalog", net.getStatusMessage());
+        assertEquals(Driver.Status.STALE, ext.getStatus());
+        assertEquals("2.0.0", ext.getLatestVersion());
+    }
+
+    @Test
+    void multiEntryUpdateMatchesEveryHardwareIdAndPrefersEntryVersion() {
+        String other = "PCI\\VEN_8086&DEV_51F1";
+        Driver a = driver("A", "22.100.0.0", "2023-01-01", HWID);
+        Driver b = driver("B", "22.100.0.0", "2023-01-01", other);
+
+        service().applyBatchOutput(List.of(a, b), List.of(
+            upd(HWID, "2024-06-01", "Net", "5005565", GUID, "22.120.0.0", "Intel - Net - 22.110.1.1"),
+            upd(other, "2024-06-01", "Net", "5005565", GUID, "22.120.0.0", "Intel - Net - 22.110.1.1"),
+            "DONE"));
+
+        for (Driver d : List.of(a, b)) {
+            assertEquals(Driver.Status.STALE, d.getStatus());
+            assertEquals("22.120.0.0", d.getLatestVersion());
+            assertEquals(GUID, d.getUpdateId());
+        }
+    }
+
+    @Test
+    void catalogScriptIteratesEntriesTargetsWindowsUpdateAndIsUtf8() {
+        String s = WindowsUpdateCatalogService.CATALOG_SCRIPT;
+        assertTrue(s.contains("$u.WindowsDriverUpdateEntries"), s);
+        assertTrue(s.contains("$searcher.ServerSelection = 2"), s);
+        assertTrue(s.contains("[Console]::OutputEncoding = [Text.Encoding]::UTF8"), s);
+        assertFalse(s.contains("\""), "no double quotes in PowerShell script");
+    }
+
+    @Test
+    void scannerScriptEmitsInvariantUtcDriverDate() {
+        String s = DriverScannerService.PS_QUERY;
+        assertTrue(s.contains("ToUniversalTime().ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)"), s);
+        assertFalse(s.contains("\""), "no double quotes in PowerShell script");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = ';', value = {
+        "2023-01-05;                  2023-01-05",
+        "20230105000000.000000-000;   2023-01-05",
+        "1/5/2023 12:00:00 AM;        2023-01-05",
+    })
+    void driverDateParsesInvariantAndLegacyFormats(String raw, String expected) {
+        assertEquals(java.time.LocalDate.parse(expected), CatalogMatcher.parseDriverDate(raw));
+    }
+
+    @Test
+    void utf8OutputWithBomIsReadAsUtf8() throws Exception {
+        String line = "UPD|" + HWID + "|2024-06-01|M|Realtek®|Net||" + GUID + "||Realtek® – Net – 2.0.0";
+        WindowsUpdateCatalogService svc = new WindowsUpdateCatalogService(new OemUpdateService()) {
+            @Override
+            Process startPowerShell(String script, File output) throws Exception {
+                byte[] body = (line + "\r\nDONE\r\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                byte[] bom = {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF};
+                java.nio.file.Files.write(output.toPath(), bom);
+                java.nio.file.Files.write(output.toPath(), body, java.nio.file.StandardOpenOption.APPEND);
+                return new FakeProcess(true);
+            }
+        };
+
+        assertEquals(List.of(line, "DONE"), svc.runBatchScript("x"));
     }
 
     @Test
@@ -202,17 +321,25 @@ class HardwareIdMatchTest {
         svc.batchCheckForUpdates(new ArrayList<>(List.of(d)));
 
         assertTrue(proc.destroyed);
+        assertTrue(proc.waitedAfterDestroy, "temp file must not be deleted before the killed process exits");
         assertEquals(Driver.Status.UNKNOWN, d.getStatus());
         assertTrue(d.getStatusMessage().contains("timed out"), d.getStatusMessage());
     }
 
     static class FakeProcess extends Process {
+        final boolean finishes;
         boolean destroyed;
+        boolean waitedAfterDestroy;
+        FakeProcess() { this(false); }
+        FakeProcess(boolean finishes) { this.finishes = finishes; }
         @Override public OutputStream getOutputStream() { return OutputStream.nullOutputStream(); }
         @Override public InputStream getInputStream() { return InputStream.nullInputStream(); }
         @Override public InputStream getErrorStream() { return InputStream.nullInputStream(); }
         @Override public int waitFor() { return 0; }
-        @Override public boolean waitFor(long t, TimeUnit u) { return false; }
+        @Override public boolean waitFor(long t, TimeUnit u) {
+            if (destroyed) waitedAfterDestroy = true;
+            return finishes;
+        }
         @Override public int exitValue() { throw new IllegalThreadStateException(); }
         @Override public void destroy() { destroyed = true; }
         @Override public Process destroyForcibly() { destroyed = true; return this; }

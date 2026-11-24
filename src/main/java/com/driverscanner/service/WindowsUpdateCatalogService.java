@@ -37,7 +37,7 @@ public class WindowsUpdateCatalogService {
      * Text fields are stripped of '|' and line breaks; Title goes last so the Java parser is exact
      * even if that fails. No double quotes: they do not survive Windows command-line quoting.
      */
-    private static final String CATALOG_SCRIPT = """
+    static final String CATALOG_SCRIPT = """
         function S($v) { if ($null -eq $v) { '' } else { ([string]$v) -replace '[|\\r\\n\\t]', ' ' } }
         try {
             $session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop;
